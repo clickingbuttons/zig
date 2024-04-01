@@ -221,7 +221,7 @@ pub const Ed25519 = struct {
         /// Verify the signature against a message and public key.
         /// Return IdentityElement or NonCanonical if the public key or signature are not in the expected range,
         /// or SignatureVerificationError if the signature is invalid for the given message and key.
-        pub fn verify(self: Signature, public_key: PublicKey, msg: []const u8) (IdentityElementError || NonCanonicalError || SignatureVerificationError || EncodingError || WeakPublicKeyError)!void {
+        pub fn verify(self: Signature, msg: []const u8, public_key: PublicKey) (IdentityElementError || NonCanonicalError || SignatureVerificationError || EncodingError || WeakPublicKeyError)!void {
             var st = try Verifier.init(self, public_key);
             st.update(msg);
             return st.verify();

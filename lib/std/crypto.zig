@@ -195,6 +195,9 @@ pub const errors = @import("crypto/errors.zig");
 pub const tls = @import("crypto/tls.zig");
 pub const Certificate = @import("crypto/Certificate.zig");
 
+pub const der = @import("crypto/der.zig");
+pub const rsa = @import("crypto/rsa.zig");
+
 /// Side-channels mitigations.
 pub const SideChannelsMitigations = enum {
     /// No additional side-channel mitigations are applied.
@@ -307,6 +310,8 @@ test {
     _ = errors;
     _ = tls;
     _ = Certificate;
+    _ = rsa;
+    _ = der;
 }
 
 test "CSPRNG" {

@@ -1,0 +1,399 @@
+//! Distinguised Encoding Rules
+//!
+//! A version of Basic Encoding Rules (BER) where there is exactly ONE way to
+//! represent non-constructed elements.
+//!
+//! Defined in X.690 and X.691.
+//!
+//! Intro material:
+//!     - https://en.wikipedia.org/wiki/X.690#DER_encoding
+//!     - https://letsencrypt.org/docs/a-warm-welcome-to-asn1-and-der
+
+pub const Parser = struct {
+    bytes: []const u8,
+    index: u32 = 0,
+
+    pub const Error = Element.ParseError || error{ InvalidBool, InvalidBitString, UnknownObjectId, EndOfStream, UnexpectedElement, InvalidDateTime };
+
+    pub fn nextBool(self: *Parser) Error!bool {
+        const ele = try self.next(.universal, false, .boolean);
+        if (ele.slice.len() != 1) return error.InvalidBool;
+        const val = self.view(ele)[0];
+        if (val == 0x00) return false;
+        if (val == 0xff) return true;
+
+        return error.InvalidBool;
+    }
+
+    pub fn nextBitstring(self: *Parser) Error!BitString {
+        const ele = try self.next(.universal, false, .bitstring);
+        const bytes = self.view(ele);
+        const right_padding = bytes[0];
+        if (right_padding >= 8) return error.InvalidBitString;
+        return .{
+            .bytes = bytes[1..],
+            .right_padding = @intCast(right_padding),
+        };
+    }
+
+    pub fn nextDateTime(self: *Parser) Error!DateTime {
+        const ele = try self.next(.universal, false, null);
+        const bytes = self.view(ele);
+        switch (ele.identifier.tag) {
+            .utc_time => {
+                // Example: "YYMMDD000000Z"
+                if (bytes.len != 13)
+                    return error.InvalidDateTime;
+                if (bytes[12] != 'Z')
+                    return error.InvalidDateTime;
+
+                return DateTime{
+                    .date = .{
+                        .year = @as(u16, 2000) + try parseTimeDigits(bytes[0..2], 0, 99),
+                        .month = @enumFromInt(try parseTimeDigits(bytes[2..4], 1, 12)),
+                        .day = try parseTimeDigits(bytes[4..6], 1, 31),
+                    },
+                    .time = try parseTime(bytes[6..12]),
+                };
+            },
+            .generalized_time => {
+                // Examples:
+                // "19920521000000Z"
+                // "19920622123421Z"
+                // "19920722132100.3Z"
+                if (bytes.len < 15)
+                    return error.InvalidDateTime;
+                return DateTime{
+                    .date = .{
+                        .year = try parseYear4(bytes[0..4]),
+                        .month = @enumFromInt(try parseTimeDigits(bytes[4..6], 1, 12)),
+                        .day = try parseTimeDigits(bytes[6..8], 1, 31),
+                    },
+                    .time = try parseTime(bytes[10..16]),
+                };
+            },
+            else => return error.InvalidDateTime,
+        }
+    }
+
+    pub fn nextEnum(self: *Parser, comptime Enum: type) Error!Enum {
+        const ele = try self.next(.universal, false, .object_identifier);
+        return Enum.oids.get(self.view(ele)) orelse return error.UnknownObjectId;
+    }
+
+    pub fn nextSequence(self: *Parser) Error!Element {
+        return try self.next(.universal, true, .sequence);
+    }
+
+    pub fn nextSequenceOf(self: *Parser) Error!Element {
+        return try self.next(.universal, true, .sequence_of);
+    }
+
+    pub fn nextPrimitive(self: *Parser, tag: ?Identifier.Tag) Error!Element {
+        return try self.next(.universal, false, tag);
+    }
+
+    pub fn next(
+        self: *Parser,
+        class: ?Identifier.Class,
+        constructed: ?bool,
+        tag: ?Identifier.Tag,
+    ) Error!Element {
+        if (self.index >= self.bytes.len) return error.EndOfStream;
+
+        const res = try Element.init(self.bytes, self.index);
+        if (tag) |e| {
+            if (res.identifier.tag != e) return error.UnexpectedElement;
+        }
+        if (constructed) |e| {
+            if (res.identifier.constructed != e) return error.UnexpectedElement;
+        }
+        if (class) |e| {
+            if (res.identifier.class != e) return error.UnexpectedElement;
+        }
+        self.index = if (res.identifier.constructed) res.slice.start else res.slice.end;
+        return res;
+    }
+
+    pub fn view(self: Parser, elem: Element) []const u8 {
+        return elem.slice.view(self.bytes);
+    }
+
+    pub fn seekEnd(self: *Parser, index: u32) void {
+        // Please parse everything.
+        if (self.index != index) {
+            std.debug.print("expected index {d}, got {d}\n", .{ index, self.index });
+            std.debug.assert(false);
+        }
+        self.index = index;
+    }
+};
+
+pub const Element = struct {
+    identifier: Identifier,
+    slice: Slice,
+
+    pub const Slice = struct {
+        start: u32,
+        end: u32,
+
+        pub fn len(self: Slice) u32 {
+            return self.end - self.start;
+        }
+
+        pub fn view(self: Slice, bytes: []const u8) []const u8 {
+            return bytes[self.start..self.end];
+        }
+    };
+
+    pub const ParseError = error{InvalidLength};
+
+    pub fn init(bytes: []const u8, index: u32) ParseError!Element {
+        var i = index;
+        const identifier = @as(Identifier, @bitCast(bytes[i]));
+        i += 1;
+        const size_byte = bytes[i];
+        i += 1;
+        if ((size_byte >> 7) == 0) {
+            return .{
+                .identifier = identifier,
+                .slice = .{
+                    .start = i,
+                    .end = i + size_byte,
+                },
+            };
+        }
+
+        const len_size = @as(u7, @truncate(size_byte));
+        if (len_size > @sizeOf(u32)) return error.InvalidLength;
+
+        const end_i = i + len_size;
+        var long_form_size: u32 = 0;
+        while (i < end_i) : (i += 1) {
+            long_form_size = (long_form_size << 8) | bytes[i];
+        }
+
+        return .{
+            .identifier = identifier,
+            .slice = .{
+                .start = i,
+                .end = i + long_form_size,
+            },
+        };
+    }
+};
+
+fn parseTimeDigits(
+    text: *const [2]u8,
+    min: comptime_int,
+    max: comptime_int,
+) !std.math.IntFittingRange(min, max) {
+    const result = std.fmt.parseInt(std.math.IntFittingRange(min, max), text, 10) catch
+        return error.InvalidDateTime;
+    if (result < min) return error.InvalidDateTime;
+    if (result > max) return error.InvalidDateTime;
+    return @truncate(result);
+}
+
+test parseTimeDigits {
+    const expectEqual = std.testing.expectEqual;
+    try expectEqual(@as(u8, 0), try parseTimeDigits("00", 0, 99));
+    try expectEqual(@as(u8, 99), try parseTimeDigits("99", 0, 99));
+    try expectEqual(@as(u8, 42), try parseTimeDigits("42", 0, 99));
+
+    const expectError = std.testing.expectError;
+    try expectError(error.TimeInvalid, parseTimeDigits("13", 1, 12));
+    try expectError(error.TimeInvalid, parseTimeDigits("00", 1, 12));
+    try expectError(error.TimeInvalid, parseTimeDigits("Di", 0, 99));
+}
+
+fn parseYear4(text: *const [4]u8) !u16 {
+    const result = std.fmt.parseInt(u16, text, 10) catch return error.InvalidDateTime;
+    if (result > 9999) return error.InvalidDateTime;
+    return @truncate(result);
+}
+
+test parseYear4 {
+    const expectEqual = std.testing.expectEqual;
+    try expectEqual(@as(u16, 0), try parseYear4("0000"));
+    try expectEqual(@as(u16, 9999), try parseYear4("9999"));
+    try expectEqual(@as(u16, 1988), try parseYear4("1988"));
+
+    const expectError = std.testing.expectError;
+    try expectError(error.TimeInvalid, parseYear4("999b"));
+    try expectError(error.TimeInvalid, parseYear4("crap"));
+    try expectError(error.TimeInvalid, parseYear4("r:bQ"));
+}
+
+fn parseTime(bytes: *const [6]u8) !std.time.epoch.Time {
+    return .{
+        .hour = try parseTimeDigits(bytes[0..2], 0, 23),
+        .minute = try parseTimeDigits(bytes[2..4], 0, 59),
+        .second = try parseTimeDigits(bytes[4..6], 0, 59),
+    };
+}
+
+pub const Identifier = packed struct(u8) {
+    tag: Tag,
+    constructed: bool,
+    class: Class,
+
+    pub const Class = enum(u2) {
+        universal,
+        application,
+        context_specific,
+        private,
+    };
+
+    // https://www.oss.com/asn1/resources/asn1-made-simple/asn1-quick-reference/asn1-tags.html
+    pub const Tag = enum(u5) {
+        boolean = 1,
+        integer = 2,
+        bitstring = 3,
+        octetstring = 4,
+        null = 5,
+        object_identifier = 6,
+        real = 9,
+        enumerated = 10,
+        string_utf8 = 12,
+        sequence = 16,
+        /// a set
+        sequence_of = 17,
+        string_numeric = 18,
+        string_printable = 19,
+        string_teletex = 20,
+        string_videotex = 21,
+        string_ia5 = 22,
+        utc_time = 23,
+        generalized_time = 24,
+        string_visible = 26,
+        string_universal = 28,
+        string_bmp = 30,
+        _,
+    };
+};
+
+pub const BitString = struct {
+    bytes: []const u8,
+    right_padding: u3,
+};
+
+pub const Oid = struct {
+    bytes: []const u8,
+
+    const oid_base = 128;
+
+    pub fn dotLen(dot_notation: []const u8) usize {
+        var res: usize = 1;
+
+        var split = std.mem.splitScalar(u8, dot_notation, '.');
+        std.debug.assert(split.next() != null);
+        std.debug.assert(split.next() != null);
+        while (split.next()) |s| {
+            const parsed = try std.fmt.parseUnsigned(usize, s, 10);
+            const n_bytes = std.math.log(f64, oid_base, parsed);
+
+            res += @intFromFloat(@ceil(n_bytes));
+            res += 1;
+        }
+
+        return res;
+    }
+
+    pub inline fn fromDot(dot_notation: []const u8) !Oid {
+        // technically infinite length, 256 is a generous upper bound that can hold
+        // the longest standard value
+        var res: [256]u8 = undefined;
+
+        var split = std.mem.splitScalar(u8, dot_notation, '.');
+        // optimization: store first two numbers in first byte
+        const first = try std.fmt.parseInt(u8, split.next().?, 10);
+        const second = try std.fmt.parseInt(u8, split.next().?, 10);
+
+        res[0] = first * 40 + second;
+
+        var i: usize = 1;
+        while (split.next()) |s| {
+            // technically, any number should be supported.
+            // however, let's be practical and set cutoff at usize
+            var parsed = try std.fmt.parseUnsigned(usize, s, 10);
+            const n_bytes = if (parsed == 0) 0 else std.math.log(usize, oid_base, parsed);
+
+            for (0..n_bytes) |j| {
+                const place = std.math.pow(usize, oid_base, n_bytes - j);
+                const digit: u8 = @intCast(@divFloor(parsed, place));
+
+                res[i] = digit | 0b10000000;
+                parsed -= digit * place;
+
+                i += 1;
+            }
+            res[i] = @intCast(parsed);
+            i += 1;
+        }
+
+        return .{ .bytes = res[0..i] };
+    }
+
+    pub fn toDecimal(self: Oid, writer: std.io.AnyWriter) !void {
+        const first = @divTrunc(self.bytes[0], 40);
+        const second = self.bytes[0] - first * 40;
+        try writer.print("{d}.{d}", .{ first, second });
+
+        var i: usize = 1;
+        while (i != self.bytes.len) {
+            const n_bytes: usize = brk: {
+                var res: usize = 1;
+                var j: usize = i;
+                while (self.bytes[j] & 0b10000000 != 0) {
+                    res += 1;
+                    j += 1;
+                }
+                break :brk res;
+            };
+
+            var n: usize = 0;
+            for (0..n_bytes) |j| {
+                const place = std.math.pow(usize, oid_base, n_bytes - j - 1);
+                n += place * (self.bytes[i] & 0b01111111);
+                i += 1;
+            }
+            try writer.print(".{d}", .{n});
+        }
+    }
+};
+
+fn testOid(expected: []const u8, dot_notation: []const u8) !void {
+    const oid = try Oid.fromDot(dot_notation);
+    try std.testing.expectEqualSlices(u8, expected, oid.bytes);
+    var dotted_notation_buf: [256]u8 = undefined;
+    var stream = std.io.fixedBufferStream(&dotted_notation_buf);
+    try oid.toDecimal(stream.writer().any());
+    try std.testing.expectEqualStrings(dot_notation, stream.getWritten());
+}
+
+test Oid {
+    // https://learn.microsoft.com/en-us/windows/win32/seccertenroll/about-object-identifier
+    try testOid(
+        &[_]u8{ 0x2b, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x15, 0x14 },
+        "1.3.6.1.4.1.311.21.20",
+    );
+    // https://luca.ntop.org/Teaching/Appunti/asn1.html
+    try testOid(&[_]u8{ 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d }, "1.2.840.113549");
+    // https://www.sysadmins.lv/blog-en/how-to-encode-object-identifier-to-an-asn1-der-encoded-string.aspx
+    try testOid(&[_]u8{ 0x2a, 0x86, 0x8d, 0x20 }, "1.2.100000");
+    try testOid(
+        &[_]u8{ 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0b },
+        "1.2.840.113549.1.1.11",
+    );
+    try testOid(&[_]u8{ 0x2b, 0x65, 0x70 }, "1.3.101.112");
+
+    // const idk = [_]u8{0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x04};
+    // const oid = Oid{ .bytes = &idk };
+    // var stream = std.io.getStdErr();
+    // try oid.toDecimal(stream.writer().any());
+    // try stream.writer().writeAll("\n");
+}
+
+const std = @import("std");
+const DateTime = std.time.epoch.DateTime;
