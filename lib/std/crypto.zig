@@ -76,7 +76,7 @@ pub const kem = struct {
     pub const ml_kem_01 = @import("crypto/ml_kem.zig").ml_kem_01;
 };
 
-/// Elliptic-curve arithmetic.
+/// Elliptic-curve cryptography.
 pub const ecc = struct {
     pub const Curve25519 = @import("crypto/25519/curve25519.zig").Curve25519;
     pub const Edwards25519 = @import("crypto/25519/edwards25519.zig").Edwards25519;

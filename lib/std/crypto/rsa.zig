@@ -1,6 +1,9 @@
 //! RFC8017: Public Key Cryptography Standards #1 v2.2 (PKCS1)
+const std = @import("../std.zig");
+const der = @import("der.zig");
 
 pub const Rsa2048Sha256 = Rsa(2048, std.crypto.hash.sha2.Sha256);
+pub const Rsa3072Sha384 = Rsa(3072, std.crypto.hash.sha2.Sha384);
 pub const Rsa4096Sha512 = Rsa(4096, std.crypto.hash.sha2.Sha512);
 
 pub fn Rsa(comptime modulus_bits: usize, comptime Hash: type) type {
@@ -73,7 +76,7 @@ pub fn Rsa(comptime modulus_bits: usize, comptime Hash: type) type {
             pub fn encrypt2(pk: PublicKey, msg: []const u8, label: []const u8) ![modulus_len]u8 {
                 // align variable names with spec
                 const k = modulus_len;
-                const lHash = label_hash(label);
+                const lHash = labelHash(label);
                 const hLen = Hash.digest_length;
 
                 if (msg.len > k - 2 * hLen - 2) return error.MessageTooLong;
@@ -200,7 +203,7 @@ pub fn Rsa(comptime modulus_bits: usize, comptime Hash: type) type {
                 const db_mask = mgf1(seed, db.len);
                 for (db, db_mask) |*v, m| v.* ^= m;
 
-                const expected_hash = label_hash(label);
+                const expected_hash = labelHash(label);
                 const actual_hash = db[0..expected_hash.len];
                 const msg_start = std.mem.indexOfScalarPos(u8, out, expected_hash.len, 1);
                 if (msg_start) |i| {
@@ -390,7 +393,7 @@ pub fn Rsa(comptime modulus_bits: usize, comptime Hash: type) type {
                 for (db, db_mask) |*v, m| v.* ^= m;
 
                 // Set leftmost bit to zero to prevent encoded message being greater than modulus
-                db[0] &= 0b011111111;
+                db[0] &= 0x7f;
 
                 @memcpy(res[res.len - hashed2.len - 1 ..][0..hashed2.len], &hashed2);
                 res[res.len - 1] = 0xbc;
@@ -546,28 +549,32 @@ pub fn Rsa(comptime modulus_bits: usize, comptime Hash: type) type {
             return res;
         }
 
-        /// For OAEP. Returned slice may be in .text, do not mutate.
-        inline fn label_hash(label: []const u8) [Hash.digest_length]u8 {
-            var res: [Hash.digest_length]u8 = undefined;
+        /// For OAEP.
+        inline fn labelHash(label: []const u8) [Hash.digest_length]u8 {
             if (label.len == 0) {
-                // love magic constants from the government!!
+                // magic constants from NIST
                 const sha2 = std.crypto.hash.sha2;
                 switch (Hash) {
-                    std.crypto.hash.Sha1 => return hexToBytes("da39a3ee" ++ "5e6b4b0d" ++ "3255bfef" ++ "95601890" ++
-                        "afd80709"),
-                    sha2.Sha256 => return hexToBytes("e3b0c442" ++ "98fc1c14" ++ "9afbf4c8" ++ "996fb924" ++
-                        "27ae41e4" ++ "649b934c" ++ "a495991b" ++ "7852b855"),
-                    sha2.Sha384 => return hexToBytes("38b060a7" ++ "51ac9638" ++ "4cd9327e" ++ "b1b1e36a" ++
-                        "21fdb711" ++ "14be0743" ++ "4c0cc7bf" ++ "63f6e1da" ++
-                        "274edebf" ++ "e76f65fb" ++ "d51ad2f1" ++ "4898b95b"),
-                    sha2.Sha512 => return hexToBytes("cf83e135" ++ "7eefb8bd" ++ "f1542850" ++ "d66d8007" ++
-                        "d620e405" ++ "0b5715dc" ++ "83f4a921" ++ "d36ce9ce" ++
-                        "47d0d13c" ++ "5d85f2b0" ++ "ff8318d2" ++ "877eec2f" ++
-                        "63b931bd" ++ "47417a81" ++ "a538327a" ++ "f927da3e"),
+                    sha2.Sha256 => return hexToBytes(
+                        \\e3b0c442 98fc1c14 9afbf4c8 996fb924
+                        \\27ae41e4 649b934c a495991b 7852b855
+                    ),
+                    sha2.Sha384 => return hexToBytes(
+                        \\38b060a7 51ac9638 4cd9327e b1b1e36a
+                        \\21fdb711 14be0743 4c0cc7bf 63f6e1da
+                        \\274edebf e76f65fb d51ad2f1 4898b95b
+                    ),
+                    sha2.Sha512 => return hexToBytes(
+                        \\cf83e135 7eefb8bd f1542850 d66d8007
+                        \\d620e405 0b5715dc 83f4a921 d36ce9ce
+                        \\47d0d13c 5d85f2b0 ff8318d2 877eec2f
+                        \\63b931bd 47417a81 a538327a f927da3e
+                    ),
                     // just use the empty hash...
                     else => {},
                 }
             }
+            var res: [Hash.digest_length]u8 = undefined;
             Hash.hash(label, &res, .{});
             return res;
         }
@@ -587,10 +594,39 @@ fn parseInteger(parser: *der.Parser) ![]const u8 {
     return parser.view(elem);
 }
 
-inline fn hexToBytes(comptime hex: []const u8) [hex.len / 2]u8 {
-    var res: [hex.len / 2]u8 = undefined;
-    _ = std.fmt.hexToBytes(&res, hex) catch unreachable;
+fn removeNonHex(comptime hex: []const u8) []const u8 {
+    var res: [hex.len]u8 = undefined;
+    var i: usize = 0;
+    for (hex) |c| {
+        if (std.ascii.isHex(c)) {
+            res[i] = c;
+            i += 1;
+        }
+    }
+    return res[0..i];
+}
+
+fn hexToBytes(comptime hex: []const u8) [removeNonHex(hex).len / 2]u8 {
+    const hex2 = comptime removeNonHex(hex);
+    comptime var res: [hex2.len / 2]u8 = undefined;
+    _ = comptime std.fmt.hexToBytes(&res, hex2) catch unreachable;
     return res;
+}
+
+test hexToBytes {
+    const hex =
+        \\e3b0c442 98fc1c14 9afbf4c8 996fb924
+        \\27ae41e4 649b934c a495991b 7852b855
+        ;
+    try std.testing.expectEqualSlices(u8,
+        &[_]u8{
+            0xe3, 0xb0, 0xc4, 0x42, 0x98, 0xfc, 0x1c, 0x14,
+            0x9a, 0xfb, 0xf4, 0xc8, 0x99, 0x6f, 0xb9, 0x24,
+            0x27, 0xae, 0x41, 0xe4, 0x64, 0x9b, 0x93, 0x4c,
+            0xa4, 0x95, 0x99, 0x1b, 0x78, 0x52, 0xb8, 0x55,
+        },
+        &hexToBytes(hex),
+    );
 }
 
 const TestT = Rsa2048Sha256;
@@ -646,9 +682,6 @@ test "rsa.PSS signature" {
     const signature = try kp.sign2(msg, null); // random salt
     try signature.verify(msg, kp.public, null);
 }
-
-const std = @import("../std.zig");
-const der = @import("der.zig");
 
 pub fn debugPrint(name: []const u8, slice: anytype) void {
     std.debug.print("{s} (len {d}) ", .{ name, slice.len });

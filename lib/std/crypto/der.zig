@@ -1,21 +1,21 @@
 //! Distinguised Encoding Rules
 //!
 //! A version of Basic Encoding Rules (BER) where there is exactly ONE way to
-//! represent non-constructed elements.
+//! represent non-constructed elements. This is useful for cryptographic signatures.
 //!
 //! Defined in X.690 and X.691.
 //!
 //! Intro material:
 //!     - https://en.wikipedia.org/wiki/X.690#DER_encoding
 //!     - https://letsencrypt.org/docs/a-warm-welcome-to-asn1-and-der
+const std = @import("std");
+const DateTime = std.DateTime;
 
 pub const Parser = struct {
     bytes: []const u8,
     index: u32 = 0,
 
-    pub const Error = Element.ParseError || error{ InvalidBool, InvalidBitString, UnknownObjectId, EndOfStream, UnexpectedElement, InvalidDateTime };
-
-    pub fn nextBool(self: *Parser) Error!bool {
+    pub fn nextBool(self: *Parser) !bool {
         const ele = try self.next(.universal, false, .boolean);
         if (ele.slice.len() != 1) return error.InvalidBool;
         const val = self.view(ele)[0];
@@ -25,7 +25,7 @@ pub const Parser = struct {
         return error.InvalidBool;
     }
 
-    pub fn nextBitstring(self: *Parser) Error!BitString {
+    pub fn nextBitstring(self: *Parser) !BitString {
         const ele = try self.next(.universal, false, .bitstring);
         const bytes = self.view(ele);
         const right_padding = bytes[0];
@@ -36,7 +36,8 @@ pub const Parser = struct {
         };
     }
 
-    pub fn nextDateTime(self: *Parser) Error!DateTime {
+    /// For UTCTime 2-digit years are interpretted according to RFC 5280 (>= 50 = 1900s, else 2000s)
+    pub fn nextDateTime(self: *Parser) !DateTime {
         const ele = try self.next(.universal, false, null);
         const bytes = self.view(ele);
         switch (ele.identifier.tag) {
@@ -47,49 +48,48 @@ pub const Parser = struct {
                 if (bytes[12] != 'Z')
                     return error.InvalidDateTime;
 
-                return DateTime{
-                    .date = .{
-                        .year = @as(u16, 2000) + try parseTimeDigits(bytes[0..2], 0, 99),
-                        .month = @enumFromInt(try parseTimeDigits(bytes[2..4], 1, 12)),
-                        .day = try parseTimeDigits(bytes[4..6], 1, 31),
-                    },
-                    .time = try parseTime(bytes[6..12]),
-                };
+                var date: DateTime.Date = undefined;
+                date.year = try parseTimeDigits(bytes[0..2], 0, 99);
+                date.year += if (date.year >= 50) 1900 else 2000;
+                date.month = try parseTimeDigits(bytes[2..4], 1, 12);
+                date.day = try parseTimeDigits(bytes[4..6], 1, 31);
+                const time = try parseTime(bytes[6..12]);
+
+                return DateTime{ .date = date, .time = time };
             },
             .generalized_time => {
                 // Examples:
-                // "19920521000000Z"
                 // "19920622123421Z"
                 // "19920722132100.3Z"
                 if (bytes.len < 15)
                     return error.InvalidDateTime;
-                return DateTime{
-                    .date = .{
-                        .year = try parseYear4(bytes[0..4]),
-                        .month = @enumFromInt(try parseTimeDigits(bytes[4..6], 1, 12)),
-                        .day = try parseTimeDigits(bytes[6..8], 1, 31),
-                    },
-                    .time = try parseTime(bytes[10..16]),
-                };
+
+                var date: DateTime.Date = undefined;
+                date.year = try parseYear4(bytes[0..4]);
+                date.month = try parseTimeDigits(bytes[4..6], 1, 12);
+                date.day = try parseTimeDigits(bytes[6..8], 1, 31);
+                const time = try parseTime(bytes[10..16]);
+
+                return DateTime{ .date = date, .time = time };
             },
             else => return error.InvalidDateTime,
         }
     }
 
-    pub fn nextEnum(self: *Parser, comptime Enum: type) Error!Enum {
+    pub fn nextEnum(self: *Parser, comptime Enum: type) !Enum {
         const ele = try self.next(.universal, false, .object_identifier);
         return Enum.oids.get(self.view(ele)) orelse return error.UnknownObjectId;
     }
 
-    pub fn nextSequence(self: *Parser) Error!Element {
+    pub fn nextSequence(self: *Parser) !Element {
         return try self.next(.universal, true, .sequence);
     }
 
-    pub fn nextSequenceOf(self: *Parser) Error!Element {
+    pub fn nextSequenceOf(self: *Parser) !Element {
         return try self.next(.universal, true, .sequence_of);
     }
 
-    pub fn nextPrimitive(self: *Parser, tag: ?Identifier.Tag) Error!Element {
+    pub fn nextPrimitive(self: *Parser, tag: ?Identifier.Tag) !Element {
         return try self.next(.universal, false, tag);
     }
 
@@ -98,7 +98,7 @@ pub const Parser = struct {
         class: ?Identifier.Class,
         constructed: ?bool,
         tag: ?Identifier.Tag,
-    ) Error!Element {
+    ) !Element {
         if (self.index >= self.bytes.len) return error.EndOfStream;
 
         const res = try Element.init(self.bytes, self.index);
@@ -119,12 +119,7 @@ pub const Parser = struct {
         return elem.slice.view(self.bytes);
     }
 
-    pub fn seekEnd(self: *Parser, index: u32) void {
-        // Please parse everything.
-        if (self.index != index) {
-            std.debug.print("expected index {d}, got {d}\n", .{ index, self.index });
-            std.debug.assert(false);
-        }
+    pub fn seek(self: *Parser, index: u32) void {
         self.index = index;
     }
 };
@@ -190,9 +185,9 @@ fn parseTimeDigits(
 ) !std.math.IntFittingRange(min, max) {
     const result = std.fmt.parseInt(std.math.IntFittingRange(min, max), text, 10) catch
         return error.InvalidDateTime;
-    if (result < min) return error.InvalidDateTime;
-    if (result > max) return error.InvalidDateTime;
-    return @truncate(result);
+    if (result < min) return error.InvalidTime;
+    if (result > max) return error.InvalidTime;
+    return result;
 }
 
 test parseTimeDigits {
@@ -202,15 +197,15 @@ test parseTimeDigits {
     try expectEqual(@as(u8, 42), try parseTimeDigits("42", 0, 99));
 
     const expectError = std.testing.expectError;
-    try expectError(error.TimeInvalid, parseTimeDigits("13", 1, 12));
-    try expectError(error.TimeInvalid, parseTimeDigits("00", 1, 12));
-    try expectError(error.TimeInvalid, parseTimeDigits("Di", 0, 99));
+    try expectError(error.InvalidTime, parseTimeDigits("13", 1, 12));
+    try expectError(error.InvalidTime, parseTimeDigits("00", 1, 12));
+    try expectError(error.InvalidTime, parseTimeDigits("Di", 0, 99));
 }
 
 fn parseYear4(text: *const [4]u8) !u16 {
-    const result = std.fmt.parseInt(u16, text, 10) catch return error.InvalidDateTime;
-    if (result > 9999) return error.InvalidDateTime;
-    return @truncate(result);
+    const result = std.fmt.parseInt(u16, text, 10) catch return error.InvalidYear;
+    if (result > 9999) return error.InvalidYear;
+    return result;
 }
 
 test parseYear4 {
@@ -220,12 +215,12 @@ test parseYear4 {
     try expectEqual(@as(u16, 1988), try parseYear4("1988"));
 
     const expectError = std.testing.expectError;
-    try expectError(error.TimeInvalid, parseYear4("999b"));
-    try expectError(error.TimeInvalid, parseYear4("crap"));
-    try expectError(error.TimeInvalid, parseYear4("r:bQ"));
+    try expectError(error.InvalidYear, parseYear4("999b"));
+    try expectError(error.InvalidYear, parseYear4("crap"));
+    try expectError(error.InvalidYear, parseYear4("r:bQ"));
 }
 
-fn parseTime(bytes: *const [6]u8) !std.time.epoch.Time {
+fn parseTime(bytes: *const [6]u8) !std.Time {
     return .{
         .hour = try parseTimeDigits(bytes[0..2], 0, 23),
         .minute = try parseTimeDigits(bytes[2..4], 0, 59),
@@ -394,6 +389,3 @@ test Oid {
     // try oid.toDecimal(stream.writer().any());
     // try stream.writer().writeAll("\n");
 }
-
-const std = @import("std");
-const DateTime = std.time.epoch.DateTime;

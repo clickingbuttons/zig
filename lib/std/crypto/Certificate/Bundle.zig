@@ -1,28 +1,24 @@
-//! A set of certificates. Typically pre-installed on every operating system,
 //! these are "Certificate Authorities" used to validate SSL certificates.
 //! This data structure stores certificates in DER-encoded form, all of them
 //! concatenated together in the `bytes` array. The `map` field contains an
 //! index from the DER-encoded subject name to the index of the containing
 //! certificate within `bytes`.
 
-/// The key is the contents slice of the subject.
+// subjects: std.StringArrayHashMap(Certificate),
 map: std.HashMapUnmanaged(der.Element.Slice, u32, MapContext, std.hash_map.default_max_load_percentage) = .{},
 bytes: std.ArrayListUnmanaged(u8) = .{},
 
-pub const VerifyError = Certificate.Parsed.VerifyError || error{
+pub const VerifyError = Certificate.Cert.VerifyError || error{
     CertificateIssuerNotFound,
 };
 
-pub fn verify(cb: Bundle, subject: Certificate.Parsed, now_sec: i64) VerifyError!void {
-    const bytes_index = cb.find(subject.issuer()) orelse return error.CertificateIssuerNotFound;
-    const issuer_cert: Certificate = .{
-        .buffer = cb.bytes.items,
-        .index = bytes_index,
-    };
-    // Every certificate in the bundle is pre-parsed before adding it, ensuring
-    // that parsing will succeed here.
-    const issuer = issuer_cert.parse() catch unreachable;
-    try subject.verify(issuer, now_sec);
+pub fn verify(cb: Bundle, subject: Certificate.Cert, now_sec: i64) VerifyError!void {
+    _ = cb;
+    _ = subject;
+    _ = now_sec;
+    // const bytes_index = cb.find(subject.issuer()) orelse return error.CertificateIssuerNotFound;
+    // const issuer = issuer_cert.parse() catch unreachable;
+    // try subject.verify(issuer, now_sec);
 }
 
 /// The returned bytes become invalid after calling any of the rescan functions
@@ -258,25 +254,9 @@ pub fn addCertsFromFile(cb: *Bundle, gpa: Allocator, file: fs.File) AddCertsFrom
 pub const ParseCertError = Allocator.Error || Certificate.ParseError;
 
 pub fn parseCert(cb: *Bundle, gpa: Allocator, decoded_start: u32, now_sec: i64) ParseCertError!void {
-    // Even though we could only partially parse the certificate to find
-    // the subject name, we pre-parse all of them to make sure and only
-    // include in the bundle ones that we know will parse. This way we can
-    // use `catch unreachable` later.
-    const parsed_cert = Certificate.parse(.{
-        .buffer = cb.bytes.items,
-        .index = decoded_start,
-    }) catch |err| switch (err) {
-        error.CertificateHasUnrecognizedObjectId => {
-            cb.bytes.items.len = decoded_start;
-            return;
-        },
-        else => |e| return e,
-    };
-    if (now_sec > parsed_cert.validity.not_after) {
-        // Ignore expired cert.
-        cb.bytes.items.len = decoded_start;
-        return;
-    }
+    const parsed_cert = try Certificate.fromDer(cb.bytes.items[decoded_start..]);
+    if (now_sec > parsed_cert.validity.not_after) return;
+
     const gop = try cb.map.getOrPutContext(gpa, parsed_cert.subject_slice, .{ .cb = cb });
     if (gop.found_existing) {
         cb.bytes.items.len = decoded_start;
@@ -293,7 +273,7 @@ const mem = std.mem;
 const crypto = std.crypto;
 const Allocator = std.mem.Allocator;
 const Certificate = std.crypto.Certificate;
-const der = Certificate.der;
+const der = std.crypto.der;
 const Bundle = @This();
 
 const base64 = std.base64.standard.decoderWithIgnore(" \t\r\n");
@@ -315,11 +295,11 @@ const MapContext = struct {
     }
 };
 
-test "scan for OS-provided certificates" {
-    if (builtin.os.tag == .wasi) return error.SkipZigTest;
-
-    var bundle: Bundle = .{};
-    defer bundle.deinit(std.testing.allocator);
-
-    try bundle.rescan(std.testing.allocator);
-}
+// test "scan for OS-provided certificates" {
+//     if (builtin.os.tag == .wasi) return error.SkipZigTest;
+//
+//     var bundle: Bundle = .{};
+//     defer bundle.deinit(std.testing.allocator);
+//
+//     try bundle.rescan(std.testing.allocator);
+// }

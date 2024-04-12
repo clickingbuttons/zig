@@ -13,6 +13,7 @@ pub const sha2 = struct {
     pub const HmacSha512 = Hmac(crypto.hash.sha2.Sha512);
 };
 
+/// Hash-based Message Authentication Code
 pub fn Hmac(comptime Hash: type) type {
     return struct {
         const Self = @This();
