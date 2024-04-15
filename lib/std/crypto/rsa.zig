@@ -2,11 +2,14 @@
 const std = @import("../std.zig");
 const der = @import("der.zig");
 
-pub const Rsa2048Sha256 = Rsa(2048, std.crypto.hash.sha2.Sha256);
-pub const Rsa3072Sha384 = Rsa(3072, std.crypto.hash.sha2.Sha384);
-pub const Rsa4096Sha512 = Rsa(4096, std.crypto.hash.sha2.Sha512);
+/// Recommend pairing with Sha256.
+pub const Rsa2048 = Rsa(2048);
+/// Recommend pairing with Sha384.
+pub const Rsa3072 = Rsa(3072);
+/// Recommend pairing with Sha512.
+pub const Rsa4096 = Rsa(4096);
 
-pub fn Rsa(comptime modulus_bits: usize, comptime Hash: type) type {
+pub fn Rsa(comptime modulus_bits: usize) type {
     // To keep implementation simpler. May be lifted in the future.
     if (modulus_bits & 8 != 0) @compileError("modulus_bits must be divisible by 8");
     return struct {
@@ -73,10 +76,10 @@ pub fn Rsa(comptime modulus_bits: usize, comptime Hash: type) type {
             }
 
             /// Encrypt a short message using Optimal Asymmetric Encryption Padding (RSAES-OAEP).
-            pub fn encrypt2(pk: PublicKey, msg: []const u8, label: []const u8) ![modulus_len]u8 {
+            pub fn encrypt2(pk: PublicKey, comptime Hash: type, msg: []const u8, label: []const u8) ![modulus_len]u8 {
                 // align variable names with spec
                 const k = modulus_len;
-                const lHash = labelHash(label);
+                const lHash = labelHash(Hash, label);
                 const hLen = Hash.digest_length;
 
                 if (msg.len > k - 2 * hLen - 2) return error.MessageTooLong;
@@ -89,10 +92,10 @@ pub fn Rsa(comptime modulus_bits: usize, comptime Hash: type) type {
                 var seed: [Hash.digest_length]u8 = undefined;
                 std.crypto.random.bytes(&seed);
 
-                const db_mask = mgf1(&seed, db.len);
+                const db_mask = mgf1(Hash, &seed, db.len);
                 for (&db, db_mask) |*v, m| v.* ^= m;
 
-                const seed_mask = mgf1(&db, hLen);
+                const seed_mask = mgf1(Hash, &db, hLen);
                 for (&seed, seed_mask) |*v, m| v.* ^= m;
 
                 var em = [_]u8{0} ++ seed ++ db;
@@ -183,6 +186,7 @@ pub fn Rsa(comptime modulus_bits: usize, comptime Hash: type) type {
             /// Decrypt a short message using RSAES-OAEP
             pub fn decrypt2(
                 kp: KeyPair,
+                comptime Hash: type,
                 ciphertext: [modulus_len]u8,
                 label: []const u8,
                 out: *[modulus_len]u8,
@@ -198,14 +202,14 @@ pub fn Rsa(comptime modulus_bits: usize, comptime Hash: type) type {
                 const seed = out[1..][0..hLen];
                 const db = out[1 + hLen ..];
 
-                const seed_mask = mgf1(db, hLen);
+                const seed_mask = mgf1(Hash, db, hLen);
                 for (seed, seed_mask) |*v, m| v.* ^= m;
-                const db_mask = mgf1(seed, db.len);
+                const db_mask = mgf1(Hash, seed, db.len);
                 for (db, db_mask) |*v, m| v.* ^= m;
 
-                const expected_hash = labelHash(label);
+                const expected_hash = labelHash(Hash, label);
                 const actual_hash = db[0..expected_hash.len];
-                const msg_start = std.mem.indexOfScalarPos(u8, out, expected_hash.len, 1);
+                const msg_start = std.mem.indexOfScalarPos(u8, out, expected_hash.len + 1, 1);
                 if (msg_start) |i| {
                     // Care shall be taken to ensure that an opponent cannot
                     // distinguish these error conditions, whether by error
@@ -218,20 +222,20 @@ pub fn Rsa(comptime modulus_bits: usize, comptime Hash: type) type {
             }
 
             /// Uses PKCS1-v1_5 (RSASSA-PKCS1-v1_5).
-            pub fn sign(kp: KeyPair, msg: []const u8) !PKCS1v1_5.Signature {
-                var st = try kp.signer();
+            pub fn sign(kp: KeyPair, comptime Hash: type, msg: []const u8) !PKCS1v1_5(Hash).Signature {
+                var st = try kp.signer(Hash);
                 st.update(msg);
                 return st.finalize();
             }
 
             /// Uses PKCS1-v1_5 (RSASSA-PKCS1-v1_5).
-            pub fn signer(kp: KeyPair) !PKCS1v1_5.Signer {
-                return PKCS1v1_5.Signer.init(kp);
+            pub fn signer(kp: KeyPair, comptime Hash: type) !PKCS1v1_5(Hash).Signer {
+                return PKCS1v1_5(Hash).Signer.init(kp);
             }
 
             /// Uses Probabilistic Signature Scheme (RSASSA-PSS).
-            pub fn sign2(kp: KeyPair, msg: []const u8, salt: ?[]const u8) !PSS.Signature {
-                var st = try kp.signer2(salt);
+            pub fn sign2(kp: KeyPair, comptime Hash: type, msg: []const u8, salt: ?[]const u8) !PSS(Hash).Signature {
+                var st = try kp.signer2(Hash, salt);
                 st.update(msg);
                 return st.finalize();
             }
@@ -239,8 +243,8 @@ pub fn Rsa(comptime modulus_bits: usize, comptime Hash: type) type {
             /// Uses Probabilistic Signature Scheme (RSASSA-PSS).
             ///
             /// Salt must outlive returned `PSS.Signer`.
-            pub fn signer2(kp: KeyPair, salt: ?[]const u8) !PSS.Signer {
-                return PSS.Signer.init(kp, salt);
+            pub fn signer2(kp: KeyPair, comptime Hash: type, salt: ?[]const u8) !PSS(Hash).Signer {
+                return PSS(Hash).Signer.init(kp, salt);
             }
 
             /// Encrypt short plaintext with secret key.
@@ -253,283 +257,318 @@ pub fn Rsa(comptime modulus_bits: usize, comptime Hash: type) type {
             }
         };
 
-        /// Probabilistic Signature Scheme (RSASSA-PSS)
-        pub const PSS = struct {
-            pub const default_salt_len = Hash.digest_length;
+        pub const Signature = struct {
+            bytes: [modulus_len]u8,
 
-            pub const Signature = struct {
-                bytes: [modulus_len]u8,
+            pub const encoded_length = modulus_len;
 
-                const Self = @This();
+            pub fn fromBytes(bytes: [modulus_len]u8) Signature {
+                return .{ .bytes = bytes };
+            }
 
-                pub const encoded_length = modulus_len;
+            pub fn fromDer(parser: *der.Parser) !Signature {
+                if (parser.bytes.len != modulus_len) return error.InvalidLength;
+                return .{ .bytes = parser.bytes[0..modulus_len].* };
+            }
 
-                pub fn fromBytes(msg: [modulus_len]u8) Self {
-                    return .{ .signature = msg };
-                }
+            pub fn pss(self: @This(), comptime Hash: type) PSS(Hash) {
+                return PSS(Hash).Signature{ .bytes = self.bytes };
+            }
 
-                pub fn toBytes(self: Signature) [encoded_length]u8 {
-                    return self.bytes;
-                }
-
-                pub fn verifier(self: Signature, public_key: PublicKey) !Verifier {
-                    return Verifier.init(self, public_key);
-                }
-
-                pub fn verify(self: Signature, msg: []const u8, public_key: PublicKey, salt_len: ?usize) !void {
-                    var st = Verifier.init(self, public_key, salt_len orelse default_salt_len);
-                    st.update(msg);
-                    return st.verify();
-                }
-            };
-
-            pub const Signer = struct {
-                h: Hash,
-                key_pair: KeyPair,
-                salt: ?[]const u8,
-
-                fn init(key_pair: KeyPair, salt: ?[]const u8) Signer {
-                    return .{
-                        .h = Hash.init(.{}),
-                        .key_pair = key_pair,
-                        .salt = salt,
-                    };
-                }
-
-                pub fn update(self: *Signer, data: []const u8) void {
-                    self.h.update(data);
-                }
-
-                pub fn finalize(self: *Signer) !Signature {
-                    var hashed: [Hash.digest_length]u8 = undefined;
-                    self.h.final(&hashed);
-
-                    const salt = if (self.salt) |s| s else brk: {
-                        var res: [default_salt_len]u8 = undefined;
-                        std.crypto.random.bytes(&res);
-                        break :brk &res;
-                    };
-
-                    var em = try encode(hashed, salt);
-                    self.key_pair.encrypt(&em, &em) catch unreachable;
-                    return .{ .bytes = em };
-                }
-            };
-
-            pub const Verifier = struct {
-                h: Hash,
-                sig: Signature,
-                public_key: PublicKey,
-                salt_len: usize,
-
-                fn init(sig: Signature, public_key: PublicKey, salt_len: usize) Verifier {
-                    return Verifier{
-                        .h = Hash.init(.{}),
-                        .sig = sig,
-                        .public_key = public_key,
-                        .salt_len = salt_len,
-                    };
-                }
-
-                pub fn update(self: *Verifier, data: []const u8) void {
-                    self.h.update(data);
-                }
-
-                pub fn verify(self: *Verifier) !void {
-                    const pk = self.public_key;
-                    const s = Fe.fromBytes(pk.modulus, &self.sig.bytes, .big) catch unreachable;
-                    const emm = pk.modulus.powPublic(s, pk.public_exponent) catch unreachable;
-
-                    var em: [modulus_len]u8 = undefined;
-                    emm.toBytes(&em, .big) catch unreachable;
-
-                    if (modulus_len < Hash.digest_length + self.salt_len + 2) return error.Inconsistent;
-                    if (em[em.len - 1] != 0xbc) return error.Inconsistent;
-
-                    const db = em[0 .. modulus_len - Hash.digest_length - 1];
-                    const expected_hash = em[db.len..][0..Hash.digest_length];
-                    const db_mask = mgf1(expected_hash, db.len);
-                    for (db, db_mask) |*v, m| v.* ^= m;
-                    // Set leftmost bit to zero to prevent encoded message being greater than modulus
-                    db[0] &= 0b01111111;
-
-                    for (0..db.len - self.salt_len - 1) |i| {
-                        if (db[i] != 0) return error.Inconsistent;
-                    }
-                    if (db[db.len - self.salt_len - 1] != 1) return error.Inconsistent;
-                    const salt = db[db.len - self.salt_len ..];
-                    var mp_buf: [modulus_len]u8 = undefined;
-                    var mp = mp_buf[0 .. 8 + Hash.digest_length + self.salt_len];
-                    @memset(mp[0..8], 0);
-                    self.h.final(mp[8..][0..Hash.digest_length]);
-                    @memcpy(mp[8 + Hash.digest_length ..][0..salt.len], salt);
-
-                    var actual_hash: [Hash.digest_length]u8 = undefined;
-                    Hash.hash(mp, &actual_hash, .{});
-
-                    if (!std.mem.eql(u8, expected_hash, &actual_hash)) return error.Inconsistent;
-                }
-            };
-
-            fn encode(hashed: [Hash.digest_length]u8, salt: []const u8) ![modulus_len]u8 {
-                var res = [_]u8{0} ** modulus_len;
-
-                if (modulus_len < Hash.digest_length + salt.len + 2) return error.Encoding;
-
-                var mp: [modulus_len]u8 = undefined;
-                const mp_len = 8 + Hash.digest_length + salt.len;
-                @memset(mp[0..8], 0);
-                @memcpy(mp[8..][0..Hash.digest_length], &hashed);
-                @memcpy(mp[8 + Hash.digest_length ..][0..salt.len], salt);
-
-                var hashed2: [Hash.digest_length]u8 = undefined;
-                Hash.hash(mp[0..mp_len], &hashed2, .{});
-
-                var db = res[0 .. modulus_len - Hash.digest_length - 1];
-                db[db.len - salt.len - 1] = 1;
-                @memcpy(db[db.len - salt.len ..], salt);
-
-                const db_mask = mgf1(&hashed2, db.len);
-                for (db, db_mask) |*v, m| v.* ^= m;
-
-                // Set leftmost bit to zero to prevent encoded message being greater than modulus
-                db[0] &= 0x7f;
-
-                @memcpy(res[res.len - hashed2.len - 1 ..][0..hashed2.len], &hashed2);
-                res[res.len - 1] = 0xbc;
-
-                return res;
+            pub fn pkcsv1_5(self: @This(), comptime Hash: type) PSS(Hash) {
+                return PKCS1v1_5(Hash).Signature{ .bytes = self.bytes };
             }
         };
 
         /// Signature Scheme with Appendix v1.5 (RSASSA-PKCS1-v1_5)
-        pub const PKCS1v1_5 = struct {
-            pub const Signature = struct {
-                bytes: [modulus_len]u8,
+        ///
+        /// This standard has been superceded by PSS which is formally proven secure.
+        /// This is not formally proven secure nor insecure as of 2024.
+        pub fn PKCS1v1_5(comptime Hash: type) type {
+            return struct {
+                const PkcsT = @This();
+                pub const Signature = struct {
+                    bytes: [modulus_len]u8,
 
-                const Self = @This();
+                    const Self = @This();
 
-                pub const encoded_length = modulus_len;
+                    pub const encoded_length = modulus_len;
 
-                pub fn fromBytes(msg: [modulus_len]u8) Self {
-                    return .{ .signature = msg };
-                }
+                    pub fn fromBytes(msg: [modulus_len]u8) Self {
+                        return .{ .signature = msg };
+                    }
 
-                pub fn verifier(self: Signature, public_key: PublicKey) !Verifier {
-                    return Verifier.init(self, public_key);
-                }
+                    pub fn verifier(self: Self, public_key: PublicKey) !Verifier {
+                        return Verifier.init(self, public_key);
+                    }
 
-                pub fn verify(self: Signature, msg: []const u8, public_key: PublicKey) !void {
-                    var st = Verifier.init(self, public_key);
-                    st.update(msg);
-                    return st.verify();
-                }
-            };
-
-            pub const Signer = struct {
-                h: Hash,
-                key_pair: KeyPair,
-
-                fn init(key_pair: KeyPair) Signer {
-                    return .{
-                        .h = Hash.init(.{}),
-                        .key_pair = key_pair,
-                    };
-                }
-
-                pub fn update(self: *Signer, data: []const u8) void {
-                    self.h.update(data);
-                }
-
-                pub fn finalize(self: *Signer) !Signature {
-                    var hash: [Hash.digest_length]u8 = undefined;
-                    self.h.final(&hash);
-
-                    var em = emsaEncode(hash);
-                    self.key_pair.encrypt(&em, &em) catch unreachable;
-                    return .{ .bytes = em };
-                }
-            };
-
-            pub const Verifier = struct {
-                h: Hash,
-                sig: Signature,
-                public_key: PublicKey,
-
-                fn init(sig: Signature, public_key: PublicKey) Verifier {
-                    return Verifier{
-                        .h = Hash.init(.{}),
-                        .sig = sig,
-                        .public_key = public_key,
-                    };
-                }
-
-                pub fn update(self: *Verifier, data: []const u8) void {
-                    self.h.update(data);
-                }
-
-                pub fn verify(self: *Verifier) !void {
-                    const pk = self.public_key;
-                    const s = Fe.fromBytes(pk.modulus, &self.sig.bytes, .big) catch unreachable;
-                    const emm = pk.modulus.powPublic(s, pk.public_exponent) catch unreachable;
-
-                    var em: [modulus_len]u8 = undefined;
-                    emm.toBytes(&em, .big) catch unreachable;
-
-                    var hash: [Hash.digest_length]u8 = undefined;
-                    self.h.final(&hash);
-
-                    const expected = emsaEncode(hash);
-
-                    if (!std.mem.eql(u8, &expected, &em)) return error.Inconsistent;
-                }
-            };
-
-            /// Encrypted Message Signature Appendix
-            fn emsaEncode(hash: [Hash.digest_length]u8) [modulus_len]u8 {
-                const digest_header = digestHeader();
-                const tLen = digest_header.len + Hash.digest_length;
-                const emLen = modulus_len;
-                if (emLen < tLen + 11) @compileError("modulus_len too short");
-
-                return [_]u8{ 0, 1 } ++
-                    ([_]u8{0xff} ** (emLen - tLen - 3)) ++
-                    [_]u8{0} ++
-                    digest_header ++
-                    hash;
-            }
-
-            /// DER encoded header. Sequence of digest algo + digest.
-            fn digestHeader() [19]u8 {
-                const sha2 = std.crypto.hash.sha2;
-                return switch (Hash) {
-                    sha2.Sha224 => [_]u8{
-                        0x30, 0x2d, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86,
-                        0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x04, 0x05,
-                        0x00, 0x04, 0x1c,
-                    },
-                    sha2.Sha256 => [_]u8{
-                        0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86,
-                        0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01, 0x05,
-                        0x00, 0x04, 0x20,
-                    },
-                    sha2.Sha384 => [_]u8{
-                        0x30, 0x41, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86,
-                        0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x02, 0x05,
-                        0x00, 0x04, 0x30,
-                    },
-                    sha2.Sha512 => [_]u8{
-                        0x30, 0x51, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86,
-                        0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x03, 0x05,
-                        0x00, 0x04, 0x40,
-                    },
-                    else => @compileError("unknown Hash"),
+                    pub fn verify(self: Self, msg: []const u8, public_key: PublicKey) !void {
+                        var st = Verifier.init(self, public_key);
+                        st.update(msg);
+                        return st.verify();
+                    }
                 };
-            }
-        };
+
+                pub const Signer = struct {
+                    h: Hash,
+                    key_pair: KeyPair,
+
+                    fn init(key_pair: KeyPair) Signer {
+                        return .{
+                            .h = Hash.init(.{}),
+                            .key_pair = key_pair,
+                        };
+                    }
+
+                    pub fn update(self: *Signer, data: []const u8) void {
+                        self.h.update(data);
+                    }
+
+                    pub fn finalize(self: *Signer) !PkcsT.Signature {
+                        var hash: [Hash.digest_length]u8 = undefined;
+                        self.h.final(&hash);
+
+                        var em = emsaEncode(hash);
+                        self.key_pair.encrypt(&em, &em) catch unreachable;
+                        return .{ .bytes = em };
+                    }
+                };
+
+                pub const Verifier = struct {
+                    h: Hash,
+                    sig: PkcsT.Signature,
+                    public_key: PublicKey,
+
+                    fn init(sig: PkcsT.Signature, public_key: PublicKey) Verifier {
+                        return Verifier{
+                            .h = Hash.init(.{}),
+                            .sig = sig,
+                            .public_key = public_key,
+                        };
+                    }
+
+                    pub fn update(self: *Verifier, data: []const u8) void {
+                        self.h.update(data);
+                    }
+
+                    pub fn verify(self: *Verifier) !void {
+                        const pk = self.public_key;
+                        const s = Fe.fromBytes(pk.modulus, &self.sig.bytes, .big) catch unreachable;
+                        const emm = pk.modulus.powPublic(s, pk.public_exponent) catch unreachable;
+
+                        var em: [modulus_len]u8 = undefined;
+                        emm.toBytes(&em, .big) catch unreachable;
+
+                        var hash: [Hash.digest_length]u8 = undefined;
+                        self.h.final(&hash);
+
+                        const expected = emsaEncode(hash);
+
+                        if (!std.mem.eql(u8, &expected, &em)) return error.Inconsistent;
+                    }
+                };
+
+                /// Encrypted Message Signature Appendix
+                fn emsaEncode(hash: [Hash.digest_length]u8) [modulus_len]u8 {
+                    const digest_header = digestHeader();
+                    const tLen = digest_header.len + Hash.digest_length;
+                    const emLen = modulus_len;
+                    if (emLen < tLen + 11) @compileError("modulus_len too short");
+
+                    return [_]u8{ 0, 1 } ++
+                        ([_]u8{0xff} ** (emLen - tLen - 3)) ++
+                        [_]u8{0} ++
+                        digest_header ++
+                        hash;
+                }
+
+                /// DER encoded header. Sequence of digest algo + digest.
+                fn digestHeader() [19]u8 {
+                    const sha2 = std.crypto.hash.sha2;
+                    return switch (Hash) {
+                        sha2.Sha224 => [_]u8{
+                            0x30, 0x2d, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86,
+                            0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x04, 0x05,
+                            0x00, 0x04, 0x1c,
+                        },
+                        sha2.Sha256 => [_]u8{
+                            0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86,
+                            0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01, 0x05,
+                            0x00, 0x04, 0x20,
+                        },
+                        sha2.Sha384 => [_]u8{
+                            0x30, 0x41, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86,
+                            0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x02, 0x05,
+                            0x00, 0x04, 0x30,
+                        },
+                        sha2.Sha512 => [_]u8{
+                            0x30, 0x51, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86,
+                            0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x03, 0x05,
+                            0x00, 0x04, 0x40,
+                        },
+                        else => @compileError("unknown Hash"),
+                    };
+                }
+            };
+        }
+
+
+        /// Probabilistic Signature Scheme (RSASSA-PSS)
+        pub fn PSS(comptime Hash: type) type {
+            return struct {
+                // RFC 4055 S3.1
+                pub const default_salt_len = 32;
+
+                pub const Signature = struct {
+                    bytes: [modulus_len]u8,
+
+                    const Self = @This();
+
+                    pub const encoded_length = modulus_len;
+
+                    pub fn fromBytes(msg: [modulus_len]u8) Self {
+                        return .{ .signature = msg };
+                    }
+
+                    pub fn toBytes(self: Self) [encoded_length]u8 {
+                        return self.bytes;
+                    }
+
+                    pub fn verifier(self: Self, public_key: PublicKey) !Verifier {
+                        return Verifier.init(self, public_key);
+                    }
+
+                    pub fn verify(self: Self, msg: []const u8, public_key: PublicKey, salt_len: ?usize) !void {
+                        var st = Verifier.init(self, public_key, salt_len orelse default_salt_len);
+                        st.update(msg);
+                        return st.verify();
+                    }
+                };
+
+                const PssT = @This();
+
+                pub const Signer = struct {
+                    h: Hash,
+                    key_pair: KeyPair,
+                    salt: ?[]const u8,
+
+                    fn init(key_pair: KeyPair, salt: ?[]const u8) Signer {
+                        return .{
+                            .h = Hash.init(.{}),
+                            .key_pair = key_pair,
+                            .salt = salt,
+                        };
+                    }
+
+                    pub fn update(self: *Signer, data: []const u8) void {
+                        self.h.update(data);
+                    }
+
+                    pub fn finalize(self: *Signer) !PssT.Signature {
+                        var hashed: [Hash.digest_length]u8 = undefined;
+                        self.h.final(&hashed);
+
+                        const salt = if (self.salt) |s| s else brk: {
+                            var res: [default_salt_len]u8 = undefined;
+                            std.crypto.random.bytes(&res);
+                            break :brk &res;
+                        };
+
+                        var em = try encode(hashed, salt);
+                        self.key_pair.encrypt(&em, &em) catch unreachable;
+                        return .{ .bytes = em };
+                    }
+                };
+
+                pub const Verifier = struct {
+                    h: Hash,
+                    sig: PssT.Signature,
+                    public_key: PublicKey,
+                    salt_len: usize,
+
+                    fn init(sig: PssT.Signature, public_key: PublicKey, salt_len: usize) Verifier {
+                        return Verifier{
+                            .h = Hash.init(.{}),
+                            .sig = sig,
+                            .public_key = public_key,
+                            .salt_len = salt_len,
+                        };
+                    }
+
+                    pub fn update(self: *Verifier, data: []const u8) void {
+                        self.h.update(data);
+                    }
+
+                    pub fn verify(self: *Verifier) !void {
+                        const pk = self.public_key;
+                        const s = Fe.fromBytes(pk.modulus, &self.sig.bytes, .big) catch unreachable;
+                        const emm = pk.modulus.powPublic(s, pk.public_exponent) catch unreachable;
+
+                        var em: [modulus_len]u8 = undefined;
+                        emm.toBytes(&em, .big) catch unreachable;
+
+                        if (modulus_len < Hash.digest_length + self.salt_len + 2) return error.Inconsistent;
+                        if (em[em.len - 1] != 0xbc) return error.Inconsistent;
+
+                        const db = em[0 .. modulus_len - Hash.digest_length - 1];
+                        const expected_hash = em[db.len..][0..Hash.digest_length];
+                        const db_mask = mgf1(Hash, expected_hash, db.len);
+                        for (db, db_mask) |*v, m| v.* ^= m;
+                        // Set leftmost bit to zero to prevent encoded message being greater than modulus
+                        db[0] &= 0b01111111;
+
+                        for (0..db.len - self.salt_len - 1) |i| {
+                            if (db[i] != 0) return error.Inconsistent;
+                        }
+                        if (db[db.len - self.salt_len - 1] != 1) return error.Inconsistent;
+                        const salt = db[db.len - self.salt_len ..];
+                        var mp_buf: [modulus_len]u8 = undefined;
+                        var mp = mp_buf[0 .. 8 + Hash.digest_length + self.salt_len];
+                        @memset(mp[0..8], 0);
+                        self.h.final(mp[8..][0..Hash.digest_length]);
+                        @memcpy(mp[8 + Hash.digest_length ..][0..salt.len], salt);
+
+                        var actual_hash: [Hash.digest_length]u8 = undefined;
+                        Hash.hash(mp, &actual_hash, .{});
+
+                        if (!std.mem.eql(u8, expected_hash, &actual_hash)) return error.Inconsistent;
+                    }
+                };
+
+                fn encode(hashed: [Hash.digest_length]u8, salt: []const u8) ![modulus_len]u8 {
+                    var res = [_]u8{0} ** modulus_len;
+
+                    if (modulus_len < Hash.digest_length + salt.len + 2) return error.Encoding;
+
+                    var mp: [modulus_len]u8 = undefined;
+                    const mp_len = 8 + Hash.digest_length + salt.len;
+                    @memset(mp[0..8], 0);
+                    @memcpy(mp[8..][0..Hash.digest_length], &hashed);
+                    @memcpy(mp[8 + Hash.digest_length ..][0..salt.len], salt);
+
+                    var hashed2: [Hash.digest_length]u8 = undefined;
+                    Hash.hash(mp[0..mp_len], &hashed2, .{});
+
+                    var db = res[0 .. modulus_len - Hash.digest_length - 1];
+                    db[db.len - salt.len - 1] = 1;
+                    @memcpy(db[db.len - salt.len ..], salt);
+
+                    const db_mask = mgf1(Hash, &hashed2, db.len);
+                    for (db, db_mask) |*v, m| v.* ^= m;
+
+                    // Set leftmost bit to zero to prevent encoded message being greater than modulus
+                    db[0] &= 0x7f;
+
+                    @memcpy(res[res.len - hashed2.len - 1 ..][0..hashed2.len], &hashed2);
+                    res[res.len - 1] = 0xbc;
+
+                    return res;
+                }
+            };
+        }
 
         /// Mask generation function. Currently the only one defined.
-        fn mgf1(seed: []const u8, comptime len: usize) [len]u8 {
+        fn mgf1(comptime Hash: type, seed: []const u8, comptime len: usize) [len]u8 {
             var res: [len]u8 = undefined;
             const n = std.math.divCeil(usize, len, Hash.digest_length) catch unreachable;
             for (0..n - 1) |i| {
@@ -550,7 +589,7 @@ pub fn Rsa(comptime modulus_bits: usize, comptime Hash: type) type {
         }
 
         /// For OAEP.
-        inline fn labelHash(label: []const u8) [Hash.digest_length]u8 {
+        inline fn labelHash(comptime Hash: type, label: []const u8) [Hash.digest_length]u8 {
             if (label.len == 0) {
                 // magic constants from NIST
                 const sha2 = std.crypto.hash.sha2;
@@ -629,57 +668,58 @@ test hexToBytes {
     );
 }
 
-const TestT = Rsa2048Sha256;
-fn testKeypair() !TestT.KeyPair {
+const TestScheme = Rsa2048;
+const TestHash = std.crypto.hash.sha2.Sha256;
+fn testKeypair() !TestScheme.KeyPair {
     const keypair_bytes = @embedFile("testdata/id_rsa.der");
     var parser = der.Parser{ .bytes = keypair_bytes };
-    return try TestT.KeyPair.fromDer(&parser);
+    return try TestScheme.KeyPair.fromDer(&parser);
 }
 
-test "rsa.PKCS1-v1_5 encrypt and decrypt" {
+test "rsa PKCS1-v1_5 encrypt and decrypt" {
     const kp = try testKeypair();
 
     const msg = "zig zag";
     const enc = try kp.public.encrypt(msg);
-    var out: [TestT.modulus_len]u8 = undefined;
+    var out: [TestScheme.modulus_len]u8 = undefined;
     const dec = try kp.decrypt(enc, &out);
 
     try std.testing.expectEqualSlices(u8, msg, dec);
 }
 
-test "rsa.OAEP encrypt and decrypt" {
+test "rsa OAEP encrypt and decrypt" {
     const kp = try testKeypair();
 
     const msg = "zig zag";
     const label = "";
-    const enc = try kp.public.encrypt2(msg, label);
-    var out: [TestT.modulus_len]u8 = undefined;
-    const dec = try kp.decrypt2(enc, label, &out);
+    const enc = try kp.public.encrypt2(TestHash, msg, label);
+    var out: [TestScheme.modulus_len]u8 = undefined;
+    const dec = try kp.decrypt2(TestHash, enc, label, &out);
 
     try std.testing.expectEqualSlices(u8, msg, dec);
 }
 
-test "rsa.PKCS1-v1_5 signature" {
+test "rsa PKCS1-v1_5 signature" {
     const kp = try testKeypair();
 
     const msg = "zig zag";
 
-    const signature = try kp.sign(msg);
+    const signature = try kp.sign(TestHash, msg);
     try signature.verify(msg, kp.public);
 }
 
-test "rsa.PSS signature" {
+test "rsa PSS signature" {
     const kp = try testKeypair();
 
     const msg = "zig zag";
 
     const salts = [_][]const u8{ "asdf", "" };
     for (salts) |salt| {
-        const signature = try kp.sign2(msg, salt);
+        const signature = try kp.sign2(TestHash, msg, salt);
         try signature.verify(msg, kp.public, salt.len);
     }
 
-    const signature = try kp.sign2(msg, null); // random salt
+    const signature = try kp.sign2(TestHash, msg, null); // random salt
     try signature.verify(msg, kp.public, null);
 }
 

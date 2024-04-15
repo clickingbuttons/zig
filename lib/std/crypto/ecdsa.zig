@@ -6,35 +6,21 @@ const io = std.io;
 const mem = std.mem;
 const sha3 = crypto.hash.sha3;
 const testing = std.testing;
+const der = std.crypto.der;
 
 const EncodingError = crypto.errors.EncodingError;
 const IdentityElementError = crypto.errors.IdentityElementError;
 const NonCanonicalError = crypto.errors.NonCanonicalError;
 const SignatureVerificationError = crypto.errors.SignatureVerificationError;
 
-/// ECDSA over P-256 with SHA-256.
-pub const EcdsaP256Sha256 = Ecdsa(crypto.ecc.P256, crypto.hash.sha2.Sha256);
-/// ECDSA over P-256 with SHA3-256.
-pub const EcdsaP256Sha3_256 = Ecdsa(crypto.ecc.P256, crypto.hash.sha3.Sha3_256);
-/// ECDSA over P-384 with SHA-384.
-pub const EcdsaP384Sha384 = Ecdsa(crypto.ecc.P384, crypto.hash.sha2.Sha384);
-/// ECDSA over P-384 with SHA3-384.
-pub const EcdsaP384Sha3_384 = Ecdsa(crypto.ecc.P384, crypto.hash.sha3.Sha3_384);
-/// ECDSA over Secp256k1 with SHA-256.
-pub const EcdsaSecp256k1Sha256 = Ecdsa(crypto.ecc.Secp256k1, crypto.hash.sha2.Sha256);
-/// ECDSA over Secp256k1 with SHA-256(SHA-256()) -- The Bitcoin signature system.
-pub const EcdsaSecp256k1Sha256oSha256 = Ecdsa(crypto.ecc.Secp256k1, crypto.hash.composition.Sha256oSha256);
+pub const EcdsaP256 = Ecdsa(crypto.ecc.P256);
+pub const EcdsaP384 = Ecdsa(crypto.ecc.P384);
+pub const EcdsaSecp256 = Ecdsa(crypto.ecc.Secp256k1);
 
 /// Elliptic Curve Digital Signature Algorithm (ECDSA).
-pub fn Ecdsa(comptime Curve: type, comptime Hash: type) type {
-    const Prf = switch (Hash) {
-        sha3.Shake128 => sha3.KMac128,
-        sha3.Shake256 => sha3.KMac256,
-        else => crypto.auth.hmac.Hmac(Hash),
-    };
-
+pub fn Ecdsa(comptime Curve: type) type {
     return struct {
-        /// Length (in bytes) of optional random bytes, for non-deterministic signatures.
+        /// For non-deterministic signatures.
         pub const noise_length = Curve.scalar.encoded_length;
 
         /// An ECDSA secret key.
@@ -91,15 +77,15 @@ pub fn Ecdsa(comptime Curve: type, comptime Hash: type) type {
             s: Curve.scalar.CompressedScalar,
 
             /// Create a Verifier for incremental verification of a signature.
-            pub fn verifier(self: Signature, public_key: PublicKey) (NonCanonicalError || EncodingError || IdentityElementError)!Verifier {
-                return Verifier.init(self, public_key);
+            pub fn verifier(self: Signature, comptime Hash: type, public_key: PublicKey) (NonCanonicalError || EncodingError || IdentityElementError)!Verifier {
+                return Verifier(Hash).init(self, public_key);
             }
 
             /// Verify the signature against a message and public key.
             /// Return IdentityElement or NonCanonical if the public key or signature are not in the expected range,
             /// or SignatureVerificationError if the signature is invalid for the given message and key.
-            pub fn verify(self: Signature, msg: []const u8, public_key: PublicKey) (IdentityElementError || NonCanonicalError || SignatureVerificationError)!void {
-                var st = try Verifier.init(self, public_key);
+            pub fn verify(self: Signature, comptime Hash: type, msg: []const u8, public_key: PublicKey) (IdentityElementError || NonCanonicalError || SignatureVerificationError)!void {
+                var st = try Verifier(Hash).init(self, public_key);
                 st.update(msg);
                 return st.verify();
             }
@@ -144,140 +130,127 @@ pub fn Ecdsa(comptime Curve: type, comptime Hash: type) type {
                 return fb.getWritten();
             }
 
-            // Read a DER-encoded integer.
-            fn readDerInt(out: []u8, reader: anytype) EncodingError!void {
-                var buf: [2]u8 = undefined;
-                _ = reader.readNoEof(&buf) catch return error.InvalidEncoding;
-                if (buf[0] != 0x02) return error.InvalidEncoding;
-                var expected_len = @as(usize, buf[1]);
-                if (expected_len == 0 or expected_len > 1 + out.len) return error.InvalidEncoding;
-                var has_top_bit = false;
-                if (expected_len == 1 + out.len) {
-                    if ((reader.readByte() catch return error.InvalidEncoding) != 0) return error.InvalidEncoding;
-                    expected_len -= 1;
-                    has_top_bit = true;
-                }
-                const out_slice = out[out.len - expected_len ..];
-                reader.readNoEof(out_slice) catch return error.InvalidEncoding;
-                if (has_top_bit and out[0] >> 7 == 0) return error.InvalidEncoding;
-            }
+            pub fn fromDer(parser: *der.Parser) !Signature {
+                const expected_len = @sizeOf(Curve.scalar.CompressedScalar);
+                const seq = try parser.nextSequence();
+                defer parser.seek(seq.slice.end);
 
-            /// Create a signature from a DER representation.
-            /// Returns InvalidEncoding if the DER encoding is invalid.
-            pub fn fromDer(der: []const u8) EncodingError!Signature {
-                var sig: Signature = mem.zeroInit(Signature, .{});
-                var fb = io.fixedBufferStream(der);
-                const reader = fb.reader();
-                var buf: [2]u8 = undefined;
-                _ = reader.readNoEof(&buf) catch return error.InvalidEncoding;
-                if (buf[0] != 0x30 or @as(usize, buf[1]) + 2 != der.len) {
-                    return error.InvalidEncoding;
-                }
-                try readDerInt(&sig.r, reader);
-                try readDerInt(&sig.s, reader);
-                if (fb.getPos() catch unreachable != der.len) return error.InvalidEncoding;
+                const r = try parser.nextInteger();
+                if (r.slice.len() != expected_len) return error.InvalidScalarR;
+                const s = try parser.nextInteger();
+                if (s.slice.len() != expected_len) return error.InvalidScalarS;
 
-                return sig;
+                if (parser.index != seq.slice.end) return error.InvalidSequenceLength;
+                if (parser.index != parser.bytes.len) return error.InvalidSliceLength;
+
+                return Signature{
+                    .r = parser.view(r)[0..expected_len].*,
+                    .s = parser.view(s)[0..expected_len].*,
+                };
             }
         };
 
         /// A Signer is used to incrementally compute a signature.
         /// It can be obtained from a `KeyPair`, using the `signer()` function.
-        pub const Signer = struct {
-            h: Hash,
-            secret_key: SecretKey,
-            noise: ?[noise_length]u8,
+        pub fn Signer(comptime Hash: type) type {
+            return struct {
+                h: Hash,
+                secret_key: SecretKey,
+                noise: ?[noise_length]u8,
 
-            fn init(secret_key: SecretKey, noise: ?[noise_length]u8) !Signer {
-                return Signer{
-                    .h = Hash.init(.{}),
-                    .secret_key = secret_key,
-                    .noise = noise,
-                };
-            }
+                fn init(secret_key: SecretKey, noise: ?[noise_length]u8) !@This() {
+                    return .{
+                        .h = Hash.init(.{}),
+                        .secret_key = secret_key,
+                        .noise = noise,
+                    };
+                }
 
-            /// Add new data to the message being signed.
-            pub fn update(self: *Signer, data: []const u8) void {
-                self.h.update(data);
-            }
+                /// Add new data to the message being signed.
+                pub fn update(self: *@This(), data: []const u8) void {
+                    self.h.update(data);
+                }
 
-            /// Compute a signature over the entire message.
-            pub fn finalize(self: *Signer) (IdentityElementError || NonCanonicalError)!Signature {
-                const scalar_encoded_length = Curve.scalar.encoded_length;
-                const h_len = @max(Hash.digest_length, scalar_encoded_length);
-                var h: [h_len]u8 = [_]u8{0} ** h_len;
-                const h_slice = h[h_len - Hash.digest_length .. h_len];
-                self.h.final(h_slice);
+                /// Compute a signature over the entire message.
+                pub fn finalize(self: *@This()) (IdentityElementError || NonCanonicalError)!Signature {
+                    const scalar_encoded_length = Curve.scalar.encoded_length;
+                    const h_len = @max(Hash.digest_length, scalar_encoded_length);
+                    var h: [h_len]u8 = [_]u8{0} ** h_len;
+                    const h_slice = h[h_len - Hash.digest_length .. h_len];
+                    self.h.final(h_slice);
 
-                std.debug.assert(h.len >= scalar_encoded_length);
-                const z = reduceToScalar(scalar_encoded_length, h[0..scalar_encoded_length].*);
+                    std.debug.assert(h.len >= scalar_encoded_length);
+                    const z = reduceToScalar(scalar_encoded_length, h[0..scalar_encoded_length].*);
 
-                const k = deterministicScalar(h_slice.*, self.secret_key.bytes, self.noise);
+                    const k = deterministicScalar(Hash, h_slice.*, self.secret_key.bytes, self.noise);
 
-                const p = try Curve.basePoint.mul(k.toBytes(.big), .big);
-                const xs = p.affineCoordinates().x.toBytes(.big);
-                const r = reduceToScalar(Curve.Fe.encoded_length, xs);
-                if (r.isZero()) return error.IdentityElement;
+                    const p = try Curve.basePoint.mul(k.toBytes(.big), .big);
+                    const xs = p.affineCoordinates().x.toBytes(.big);
+                    const r = reduceToScalar(Curve.Fe.encoded_length, xs);
+                    if (r.isZero()) return error.IdentityElement;
 
-                const k_inv = k.invert();
-                const zrs = z.add(r.mul(try Curve.scalar.Scalar.fromBytes(self.secret_key.bytes, .big)));
-                const s = k_inv.mul(zrs);
-                if (s.isZero()) return error.IdentityElement;
+                    const k_inv = k.invert();
+                    const zrs = z.add(r.mul(try Curve.scalar.Scalar.fromBytes(self.secret_key.bytes, .big)));
+                    const s = k_inv.mul(zrs);
+                    if (s.isZero()) return error.IdentityElement;
 
-                return Signature{ .r = r.toBytes(.big), .s = s.toBytes(.big) };
-            }
-        };
+                    return Signature{ .r = r.toBytes(.big), .s = s.toBytes(.big) };
+                }
+            };
+        }
 
         /// A Verifier is used to incrementally verify a signature.
         /// It can be obtained from a `Signature`, using the `verifier()` function.
-        pub const Verifier = struct {
-            h: Hash,
-            r: Curve.scalar.Scalar,
-            s: Curve.scalar.Scalar,
-            public_key: PublicKey,
+        pub fn Verifier(comptime Hash: type) type {
+            return struct {
+                h: Hash,
+                r: Curve.scalar.Scalar,
+                s: Curve.scalar.Scalar,
+                public_key: PublicKey,
 
-            fn init(sig: Signature, public_key: PublicKey) (IdentityElementError || NonCanonicalError)!Verifier {
-                const r = try Curve.scalar.Scalar.fromBytes(sig.r, .big);
-                const s = try Curve.scalar.Scalar.fromBytes(sig.s, .big);
-                if (r.isZero() or s.isZero()) return error.IdentityElement;
+                fn init(sig: Signature, public_key: PublicKey) (IdentityElementError || NonCanonicalError)!@This() {
+                    const r = try Curve.scalar.Scalar.fromBytes(sig.r, .big);
+                    const s = try Curve.scalar.Scalar.fromBytes(sig.s, .big);
+                    if (r.isZero() or s.isZero()) return error.IdentityElement;
 
-                return Verifier{
-                    .h = Hash.init(.{}),
-                    .r = r,
-                    .s = s,
-                    .public_key = public_key,
-                };
-            }
-
-            /// Add new content to the message to be verified.
-            pub fn update(self: *Verifier, data: []const u8) void {
-                self.h.update(data);
-            }
-
-            /// Verify that the signature is valid for the entire message.
-            pub fn verify(self: *Verifier) (IdentityElementError || NonCanonicalError || SignatureVerificationError)!void {
-                const ht = Curve.scalar.encoded_length;
-                const h_len = @max(Hash.digest_length, ht);
-                var h: [h_len]u8 = [_]u8{0} ** h_len;
-                self.h.final(h[h_len - Hash.digest_length .. h_len]);
-
-                const z = reduceToScalar(ht, h[0..ht].*);
-                if (z.isZero()) {
-                    return error.SignatureVerificationFailed;
+                    return .{
+                        .h = Hash.init(.{}),
+                        .r = r,
+                        .s = s,
+                        .public_key = public_key,
+                    };
                 }
 
-                const s_inv = self.s.invert();
-                const v1 = z.mul(s_inv).toBytes(.little);
-                const v2 = self.r.mul(s_inv).toBytes(.little);
-                const v1g = try Curve.basePoint.mulPublic(v1, .little);
-                const v2pk = try self.public_key.p.mulPublic(v2, .little);
-                const vxs = v1g.add(v2pk).affineCoordinates().x.toBytes(.big);
-                const vr = reduceToScalar(Curve.Fe.encoded_length, vxs);
-                if (!self.r.equivalent(vr)) {
-                    return error.SignatureVerificationFailed;
+                /// Add new content to the message to be verified.
+                pub fn update(self: *@This(), data: []const u8) void {
+                    self.h.update(data);
                 }
-            }
-        };
+
+                /// Verify that the signature is valid for the entire message.
+                pub fn verify(self: *@This()) (IdentityElementError || NonCanonicalError || SignatureVerificationError)!void {
+                    const ht = Curve.scalar.encoded_length;
+                    const h_len = @max(Hash.digest_length, ht);
+                    var h: [h_len]u8 = [_]u8{0} ** h_len;
+                    self.h.final(h[h_len - Hash.digest_length .. h_len]);
+
+                    const z = reduceToScalar(ht, h[0..ht].*);
+                    if (z.isZero()) {
+                        return error.SignatureVerificationFailed;
+                    }
+
+                    const s_inv = self.s.invert();
+                    const v1 = z.mul(s_inv).toBytes(.little);
+                    const v2 = self.r.mul(s_inv).toBytes(.little);
+                    const v1g = try Curve.basePoint.mulPublic(v1, .little);
+                    const v2pk = try self.public_key.p.mulPublic(v2, .little);
+                    const vxs = v1g.add(v2pk).affineCoordinates().x.toBytes(.big);
+                    const vr = reduceToScalar(Curve.Fe.encoded_length, vxs);
+                    if (!self.r.equivalent(vr)) {
+                        return error.SignatureVerificationFailed;
+                    }
+                }
+            };
+        }
 
         /// An ECDSA key pair.
         pub const KeyPair = struct {
@@ -291,7 +264,7 @@ pub fn Ecdsa(comptime Curve: type, comptime Hash: type) type {
 
             /// Create a new key pair. The seed must be secret and indistinguishable from random.
             /// The seed can also be left to null in order to generate a random key pair.
-            pub fn create(seed: ?[seed_length]u8) IdentityElementError!KeyPair {
+            pub fn create(comptime Hash: type, seed: ?[seed_length]u8) IdentityElementError!KeyPair {
                 var seed_ = seed;
                 if (seed_ == null) {
                     var random_seed: [seed_length]u8 = undefined;
@@ -300,7 +273,7 @@ pub fn Ecdsa(comptime Curve: type, comptime Hash: type) type {
                 }
                 const h = [_]u8{0x00} ** Hash.digest_length;
                 const k0 = [_]u8{0x01} ** SecretKey.encoded_length;
-                const secret_key = deterministicScalar(h, k0, seed_).toBytes(.big);
+                const secret_key = deterministicScalar(Hash, h, k0, seed_).toBytes(.big);
                 return fromSecretKey(SecretKey{ .bytes = secret_key });
             }
 
@@ -314,15 +287,15 @@ pub fn Ecdsa(comptime Curve: type, comptime Hash: type) type {
             /// The noise can be null in order to create deterministic signatures.
             /// If deterministic signatures are not required, the noise should be randomly generated instead.
             /// This helps defend against fault attacks.
-            pub fn sign(key_pair: KeyPair, msg: []const u8, noise: ?[noise_length]u8) (IdentityElementError || NonCanonicalError)!Signature {
-                var st = try key_pair.signer(noise);
+            pub fn sign(key_pair: KeyPair, comptime Hash: type, msg: []const u8, noise: ?[noise_length]u8) (IdentityElementError || NonCanonicalError)!Signature {
+                var st = try key_pair.signer(Hash, noise);
                 st.update(msg);
                 return st.finalize();
             }
 
             /// Create a Signer, that can be used for incremental signature verification.
-            pub fn signer(key_pair: KeyPair, noise: ?[noise_length]u8) !Signer {
-                return Signer.init(key_pair.secret_key, noise);
+            pub fn signer(key_pair: KeyPair, comptime Hash: type, noise: ?[noise_length]u8) !Signer(Hash) {
+                return Signer(Hash).init(key_pair.secret_key, noise);
             }
         };
 
@@ -340,7 +313,13 @@ pub fn Ecdsa(comptime Curve: type, comptime Hash: type) type {
 
         // Create a deterministic scalar according to a secret key and optional noise.
         // This uses the overly conservative scheme from the "Deterministic ECDSA and EdDSA Signatures with Additional Randomness" draft.
-        fn deterministicScalar(h: [Hash.digest_length]u8, secret_key: Curve.scalar.CompressedScalar, noise: ?[noise_length]u8) Curve.scalar.Scalar {
+        fn deterministicScalar(comptime Hash: type, h: [Hash.digest_length]u8, secret_key: Curve.scalar.CompressedScalar, noise: ?[noise_length]u8,) Curve.scalar.Scalar {
+            const Prf = switch (Hash) {
+                sha3.Shake128 => sha3.KMac128,
+                sha3.Shake256 => sha3.KMac256,
+                else => crypto.auth.hmac.Hmac(Hash),
+            };
+
             var k = [_]u8{0x00} ** h.len;
             var m = [_]u8{0x00} ** (h.len + 1 + noise_length + secret_key.len + h.len);
             var t = [_]u8{0x00} ** Curve.scalar.encoded_length;
@@ -376,58 +355,59 @@ pub fn Ecdsa(comptime Curve: type, comptime Hash: type) type {
     };
 }
 
-test "Basic operations over EcdsaP384Sha384" {
+test "EcdsaP384 with Sha384" {
     if (builtin.zig_backend == .stage2_c) return error.SkipZigTest;
 
-    const Scheme = EcdsaP384Sha384;
-    const kp = try Scheme.KeyPair.create(null);
+    const Hash = std.crypto.hash.sha2.Sha384;
+    const kp = try EcdsaP384.KeyPair.create(Hash, null);
     const msg = "test";
 
-    var noise: [Scheme.noise_length]u8 = undefined;
+    var noise: [EcdsaP384.noise_length]u8 = undefined;
     crypto.random.bytes(&noise);
-    const sig = try kp.sign(msg, noise);
-    try sig.verify(msg, kp.public_key);
+    const sig = try kp.sign(Hash, msg, noise);
+    try sig.verify(Hash, msg, kp.public_key);
 
-    const sig2 = try kp.sign(msg, null);
-    try sig2.verify(msg, kp.public_key);
+    const sig2 = try kp.sign(Hash, msg, null);
+    try sig2.verify(Hash, msg, kp.public_key);
 }
 
-test "Basic operations over Secp256k1" {
+test "EcdsaSecp256 with Sha256" {
     if (builtin.zig_backend == .stage2_c) return error.SkipZigTest;
 
-    const Scheme = EcdsaSecp256k1Sha256oSha256;
-    const kp = try Scheme.KeyPair.create(null);
+    const Hash = std.crypto.hash.sha2.Sha256;
+    const kp = try EcdsaSecp256.KeyPair.create(Hash, null);
     const msg = "test";
 
-    var noise: [Scheme.noise_length]u8 = undefined;
+    var noise: [EcdsaSecp256.noise_length]u8 = undefined;
     crypto.random.bytes(&noise);
-    const sig = try kp.sign(msg, noise);
-    try sig.verify(msg, kp.public_key);
+    const sig = try kp.sign(Hash, msg, noise);
+    try sig.verify(Hash, msg, kp.public_key);
 
-    const sig2 = try kp.sign(msg, null);
-    try sig2.verify(msg, kp.public_key);
+    const sig2 = try kp.sign(Hash, msg, null);
+    try sig2.verify(Hash, msg, kp.public_key);
 }
 
-test "Basic operations over EcdsaP384Sha256" {
+test "EcdsaP384 with Sha256" {
     if (builtin.zig_backend == .stage2_c) return error.SkipZigTest;
 
-    const Scheme = Ecdsa(crypto.ecc.P384, crypto.hash.sha2.Sha256);
-    const kp = try Scheme.KeyPair.create(null);
+    const Hash = crypto.hash.sha2.Sha256;
+    const kp = try EcdsaP384.KeyPair.create(Hash, null);
     const msg = "test";
 
-    var noise: [Scheme.noise_length]u8 = undefined;
+    var noise: [EcdsaP384.noise_length]u8 = undefined;
     crypto.random.bytes(&noise);
-    const sig = try kp.sign(msg, noise);
-    try sig.verify(msg, kp.public_key);
+    const sig = try kp.sign(Hash, msg, noise);
+    try sig.verify(Hash, msg, kp.public_key);
 
-    const sig2 = try kp.sign(msg, null);
-    try sig2.verify(msg, kp.public_key);
+    const sig2 = try kp.sign(Hash, msg, null);
+    try sig2.verify(Hash, msg, kp.public_key);
 }
 
-test "Verifying a existing signature with EcdsaP384Sha256" {
+test "EcdsaP384 with Sha256 signature" {
     if (builtin.zig_backend == .stage2_c) return error.SkipZigTest;
 
-    const Scheme = Ecdsa(crypto.ecc.P384, crypto.hash.sha2.Sha256);
+    const Scheme = EcdsaP384;
+    const Hash = crypto.hash.sha2.Sha256;
     // zig fmt: off
     const sk_bytes = [_]u8{
     0x6a, 0x53, 0x9c, 0x83, 0x0f, 0x06, 0x86, 0xd9, 0xef, 0xf1, 0xe7, 0x5c, 0xae,
@@ -454,11 +434,12 @@ test "Verifying a existing signature with EcdsaP384Sha256" {
     const sk = try Scheme.SecretKey.fromBytes(sk_bytes);
     const kp = try Scheme.KeyPair.fromSecretKey(sk);
 
-    const sig_ans = try Scheme.Signature.fromDer(&sig_ans_bytes);
-    try sig_ans.verify(&msg, kp.public_key);
+    var parser = der.Parser{ .bytes = &sig_ans_bytes };
+    const sig_ans = try Scheme.Signature.fromDer(&parser);
+    try sig_ans.verify(Hash, &msg, kp.public_key);
 
-    const sig = try kp.sign(&msg, null);
-    try sig.verify(&msg, kp.public_key);
+    const sig = try kp.sign(Hash, &msg, null);
+    try sig.verify(Hash, &msg, kp.public_key);
 }
 
 const TestVector = struct {
@@ -468,7 +449,7 @@ const TestVector = struct {
     result: enum { valid, invalid, acceptable },
 };
 
-test "Test vectors from Project Wycheproof" {
+test "EcdsaP256 with Sha256 Project Wycheproof" {
     if (builtin.zig_backend == .stage2_c) return error.SkipZigTest;
 
     const vectors = [_]TestVector{
@@ -861,6 +842,7 @@ test "Test vectors from Project Wycheproof" {
         .{ .key = "04bcbb2914c79f045eaa6ecbbc612816b3be5d2d6796707d8125e9f851c18af015fffffffeecad44b6f05d15b33146549c2297b522a5eed8430cff596758e6c43d", .msg = "4d657373616765", .sig = "3045022070bebe684cdcb5ca72a42f0d873879359bd1781a591809947628d313a3814f67022100aec03aca8f5587a4d535fa31027bbe9cc0e464b1c3577f4c2dcde6b2094798a9", .result = .valid },
     };
     for (vectors) |vector| {
+        std.debug.print("try {s}\n", .{ vector.sig });
         if (tvTry(vector)) {
             try std.testing.expect(vector.result == .valid or vector.result == .acceptable);
         } else |_| {
@@ -870,28 +852,29 @@ test "Test vectors from Project Wycheproof" {
 }
 
 fn tvTry(vector: TestVector) !void {
-    const Scheme = EcdsaP256Sha256;
-    var key_sec1_: [Scheme.PublicKey.uncompressed_sec1_encoded_length]u8 = undefined;
+    const Hash = crypto.hash.sha2.Sha256;
+    var key_sec1_: [EcdsaP256.PublicKey.uncompressed_sec1_encoded_length]u8 = undefined;
     const key_sec1 = try fmt.hexToBytes(&key_sec1_, vector.key);
-    const pk = try Scheme.PublicKey.fromSec1(key_sec1);
+    const pk = try EcdsaP256.PublicKey.fromSec1(key_sec1);
     var msg_: [20]u8 = undefined;
     const msg = try fmt.hexToBytes(&msg_, vector.msg);
     var sig_der_: [152]u8 = undefined;
     const sig_der = try fmt.hexToBytes(&sig_der_, vector.sig);
-    const sig = try Scheme.Signature.fromDer(sig_der);
-    try sig.verify(msg, pk);
+    var parser = der.Parser{ .bytes = sig_der };
+    const sig = try EcdsaP256.Signature.fromDer(&parser);
+    try sig.verify(Hash, msg, pk);
 }
 
-test "Sec1 encoding/decoding" {
+test "EcdsaP384 with Sha384 sec1 encoding/decoding" {
     if (builtin.zig_backend == .stage2_c) return error.SkipZigTest;
 
-    const Scheme = EcdsaP384Sha384;
-    const kp = try Scheme.KeyPair.create(null);
+    const Hash = std.crypto.hash.sha2.Sha384;
+    const kp = try EcdsaP384.KeyPair.create(Hash, null);
     const pk = kp.public_key;
     const pk_compressed_sec1 = pk.toCompressedSec1();
-    const pk_recovered1 = try Scheme.PublicKey.fromSec1(&pk_compressed_sec1);
+    const pk_recovered1 = try EcdsaP384.PublicKey.fromSec1(&pk_compressed_sec1);
     try testing.expectEqualSlices(u8, &pk_recovered1.toCompressedSec1(), &pk_compressed_sec1);
     const pk_uncompressed_sec1 = pk.toUncompressedSec1();
-    const pk_recovered2 = try Scheme.PublicKey.fromSec1(&pk_uncompressed_sec1);
+    const pk_recovered2 = try EcdsaP384.PublicKey.fromSec1(&pk_uncompressed_sec1);
     try testing.expectEqualSlices(u8, &pk_recovered2.toUncompressedSec1(), &pk_uncompressed_sec1);
 }

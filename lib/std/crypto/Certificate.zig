@@ -15,6 +15,9 @@ subject_aliases_raw_der: ?[]const u8 = null,
 key_usage: ?KeyUsage = null,
 /// Extension further specifying how `pub_key` may be used.
 key_usage_ext: ?KeyUsageExt = null,
+/// Extension specifying maximum number of non-self-issued intermediate certificates that may
+/// follow this certificate in a valid certification path.
+max_depth: ?u8 = null,
 /// Means of identifying the public key corresponding to the private key used to
 /// sign a CRL.  The identification can be based on either the key
 /// identifier (the subject key identifier in the CRL signer's
@@ -136,19 +139,19 @@ pub fn fromDer(bytes: []const u8) !Cert {
     };
 
     // this field appears early and MUST match the later `signature` field.
-    var sig_algo: SignatureTag = undefined;
+    var sig_algo: Algorithm = undefined;
 
     {
         const cert = try parser.nextSequence();
-        defer parser.seekEnd(cert.slice.end);
+        defer parser.seek(cert.slice.end);
 
         {
             const cert_tbs = try parser.nextSequence();
-            defer parser.seekEnd(cert_tbs.slice.end);
+            defer parser.seek(cert_tbs.slice.end);
 
             {
                 const version_seq = try parser.next(.context_specific, true, @enumFromInt(0));
-                defer parser.seekEnd(version_seq.slice.end);
+                defer parser.seek(version_seq.slice.end);
 
                 const version_int = try parser.nextPrimitive(.integer);
                 const version = parser.view(version_int);
@@ -158,7 +161,8 @@ pub fn fromDer(bytes: []const u8) !Cert {
 
             const serial_number = try parser.nextPrimitive(.integer);
             res.serial_number = parser.view(serial_number);
-            sig_algo = try SignatureTag.fromDer(&parser);
+            sig_algo = try Algorithm.fromDer(&parser);
+            try sig_algo.validate();
 
             res.issuer = try Name.fromDer(&parser);
             res.validity = try Validity.fromDer(&parser);
@@ -169,7 +173,7 @@ pub fn fromDer(bytes: []const u8) !Cert {
             var optional_parsed: u8 = 0;
             while (parser.index != cert_tbs.slice.end and optional_parsed < 3) : (optional_parsed += 1) {
                 const optional_ele = try parser.next(.context_specific, null, null);
-                defer parser.seekEnd(optional_ele.slice.end);
+                defer parser.seek(optional_ele.slice.end);
 
                 switch (@intFromEnum(optional_ele.identifier.tag)) {
                     1, 2 => {
@@ -184,11 +188,12 @@ pub fn fromDer(bytes: []const u8) !Cert {
             }
         }
 
-        const sig_algo2 = try SignatureTag.fromDer(&parser);
-        if (sig_algo != sig_algo2) return error.SigAlgoMismatch;
+        const sig_algo2 = try Algorithm.fromDer(&parser);
+        if (!std.meta.eql(sig_algo, sig_algo2)) return error.SigAlgoMismatch;
 
         const sig_bitstring = try parser.nextBitstring();
-        res.signature = try Signature.fromPubKey(sig_algo, res.pub_key, sig_bitstring);
+        const sig_value = try Signature.Value.fromBitString(res.pub_key, sig_bitstring);
+        res.signature = .{ .algo = sig_algo, .value = sig_value };
     }
 
     return res;
@@ -201,20 +206,22 @@ fn parseExtensions(res: *Cert, parser: *der.Parser) !void {
         subject_alt_name,
         authority_key_identifier,
         key_usage_ext,
+        basic_constraints,
 
         pub const oids = std.ComptimeStringMap(@This(), .{
-            .{ encodedOid("2.5.29.15"), .key_usage },
-            .{ encodedOid("2.5.29.17"), .subject_alt_name },
-            .{ encodedOid("2.5.29.35"), .authority_key_identifier },
-            .{ encodedOid("2.5.29.37"), .key_usage_ext },
+            .{ &comptimeOid("2.5.29.15"), .key_usage },
+            .{ &comptimeOid("2.5.29.17"), .subject_alt_name },
+            .{ &comptimeOid("2.5.29.35"), .authority_key_identifier },
+            .{ &comptimeOid("2.5.29.37"), .key_usage_ext },
+            .{ &comptimeOid("2.5.29.19"), .basic_constraints },
         });
     };
     const seq = try parser.nextSequence();
-    defer parser.seekEnd(seq.slice.end);
+    defer parser.seek(seq.slice.end);
 
     while (parser.index != seq.slice.end) {
         const seq2 = try parser.nextSequence();
-        defer parser.seekEnd(seq2.slice.end);
+        defer parser.seek(seq2.slice.end);
 
         const tag = parser.nextEnum(ExtensionTag) catch |err| switch (err) {
             error.UnknownObjectId => .unknown,
@@ -228,7 +235,10 @@ fn parseExtensions(res: *Cert, parser: *der.Parser) !void {
         const doc_bytes = parser.view(doc);
         switch (tag) {
             .unknown => {
-                if (critical) return error.UnimplementedCriticalExtension;
+                if (critical) {
+                    rsa.debugPrint("doc",  doc_bytes);
+                    return error.UnimplementedCriticalExtension;
+                }
             },
             .key_usage => {
                 var parser2 = der.Parser{ .bytes = doc_bytes };
@@ -237,7 +247,7 @@ fn parseExtensions(res: *Cert, parser: *der.Parser) !void {
             .authority_key_identifier => {
                 var parser2 = der.Parser{ .bytes = doc_bytes };
                 const seq3 = try parser2.nextSequence();
-                defer parser2.seekEnd(seq3.slice.end);
+                defer parser2.seek(seq3.slice.end);
 
                 const pub_key_ele = try parser2.next(.context_specific, false, @enumFromInt(0));
                 res.ca_pub_key = parser2.view(pub_key_ele);
@@ -248,6 +258,16 @@ fn parseExtensions(res: *Cert, parser: *der.Parser) !void {
             },
             .subject_alt_name => {
                 res.subject_aliases_raw_der = doc_bytes;
+            },
+            .basic_constraints => {
+                var parser2 = der.Parser{ .bytes = doc_bytes };
+                const seq3 = try parser2.nextSequence();
+                if (seq3.slice.len() > 0) {
+                    const is_ca = try parser2.nextBool();
+                    const max_depth = try parser2.nextInt(i8);
+                    if (max_depth < 0) return error.InvalidBasicConstraints;
+                    if (is_ca) res.max_depth = @bitCast(max_depth);
+                }
             },
         }
     }
@@ -300,15 +320,24 @@ fn subjectAliasesIter(c: Cert) !SubjectAliasesIter {
     }
 }
 
-pub const PubKey = union(enum) {
+const PubKeyTag = enum {
+    rsa2048,
+    rsa3072,
+    rsa4096,
+    ecdsa_p256,
+    ecdsa_p384,
+    ecdsa_secp256,
+    ed25519,
+};
+
+pub const PubKey = union(PubKeyTag) {
     rsa2048: Rsa2048.PublicKey,
+    rsa3072: Rsa3072.PublicKey,
     rsa4096: Rsa4096.PublicKey,
     ecdsa_p256: EcdsaP256.PublicKey,
     ecdsa_p384: EcdsaP384.PublicKey,
-    ed25519: crypto.sign.Ed25519.PublicKey,
-
-    const EcdsaP256 = crypto.sign.ecdsa.EcdsaP256Sha256;
-    const EcdsaP384 = crypto.sign.ecdsa.EcdsaP384Sha384;
+    ecdsa_secp256: EcdsaSecP256.PublicKey,
+    ed25519: Ed25519.PublicKey,
 
     const Algo = enum {
         rsa,
@@ -316,17 +345,17 @@ pub const PubKey = union(enum) {
         ed25519,
 
         pub const oids = std.ComptimeStringMap(Algo, .{
-            .{ encodedOid("1.2.840.113549.1.1.1"), .rsa },
-            .{ encodedOid("1.2.840.10045.2.1"), .ecdsa },
-            .{ encodedOid("1.3.101.112"), .ed25519 },
+            .{ &comptimeOid("1.2.840.113549.1.1.1"), .rsa },
+            .{ &comptimeOid("1.2.840.10045.2.1"), .ecdsa },
+            .{ &comptimeOid("1.3.101.112"), .ed25519 },
         });
     };
 
     pub fn fromDer(parser: *der.Parser) !PubKey {
         const seq = try parser.nextSequence();
-        defer parser.seekEnd(seq.slice.end);
+        defer parser.seek(seq.slice.end);
         const seq2 = try parser.nextSequence();
-        defer parser.seekEnd(seq2.slice.end);
+        defer parser.seek(seq2.slice.end);
 
         const tag = try parser.nextEnum(Algo);
         switch (tag) {
@@ -339,9 +368,12 @@ pub const PubKey = union(enum) {
                 _ = try parser2.nextSequence();
 
                 const mod = try rsa.parseModulus(&parser2);
+                const elem = try parser2.nextPrimitive(.integer);
+                const pub_exp = parser2.view(elem);
                 return switch (mod.len * 8) {
-                    2048 => return .{ .rsa2048 = try Rsa2048.PublicKey.fromDer(bitstring.bytes) },
-                    4096 => return .{ .rsa4096 = try Rsa4096.PublicKey.fromDer(bitstring.bytes) },
+                    2048 => return .{ .rsa2048 = try Rsa2048.PublicKey.fromBytes(mod, pub_exp) },
+                    3072 => return .{ .rsa3072 = try Rsa3072.PublicKey.fromBytes(mod, pub_exp) },
+                    4096 => return .{ .rsa4096 = try Rsa4096.PublicKey.fromBytes(mod, pub_exp) },
                     else => return error.InvalidRsaLength,
                 };
             },
@@ -353,15 +385,17 @@ pub const PubKey = union(enum) {
                 return switch (curve) {
                     .prime256v1 => .{ .ecdsa_p256 = try EcdsaP256.PublicKey.fromSec1(bitstring.bytes) },
                     .secp384r1 => .{ .ecdsa_p384 = try EcdsaP384.PublicKey.fromSec1(bitstring.bytes) },
+                    .secp521r1 => return error.CurveUnsupported,
+                    .secp256k1 => .{ .ecdsa_secp256 = try EcdsaSecP256.PublicKey.fromSec1(bitstring.bytes) },
                 };
             },
             .ed25519 => {
                 _ = try parser.nextPrimitive(.null);
                 const bitstring = try parser.nextBitstring();
                 if (bitstring.right_padding != 0) return error.InvalidKeyLength;
-                const PublicKey = crypto.sign.Ed25519.PublicKey;
-                if (bitstring.bytes.len != PublicKey.encoded_length) return error.InvalidKeyLength;
-                const key = try PublicKey.fromBytes(bitstring.bytes[0..PublicKey.encoded_length].*);
+                const expected_len = Ed25519.PublicKey.encoded_length;
+                if (bitstring.bytes.len != expected_len) return error.InvalidKeyLength;
+                const key = try Ed25519.PublicKey.fromBytes(bitstring.bytes[0..expected_len].*);
 
                 return .{ .ed25519 = key };
             },
@@ -370,16 +404,16 @@ pub const PubKey = union(enum) {
 };
 
 pub const Validity = struct {
-    not_before: u64,
-    not_after: u64,
+    not_before: DateTime.EpochSubseconds,
+    not_after: DateTime.EpochSubseconds,
 
     pub fn fromDer(parser: *der.Parser) !Validity {
         const seq = try parser.nextSequence();
-        defer parser.seekEnd(seq.slice.end);
+        defer parser.seek(seq.slice.end);
 
         var res: Validity = undefined;
-        res.not_before = (try parser.nextDateTime()).toSeconds();
-        res.not_after = (try parser.nextDateTime()).toSeconds();
+        res.not_before = (try parser.nextDateTime()).toEpoch();
+        res.not_after = (try parser.nextDateTime()).toEpoch();
         return res;
     }
 };
@@ -438,213 +472,253 @@ pub const Version = enum(u8) {
     v3 = 2,
 };
 
-// Used in signature and public key headers
 const NamedCurve = enum {
     prime256v1,
+    secp256k1,
     secp384r1,
+    secp521r1,
 
-    pub const oids = std.ComptimeStringMap(NamedCurve, .{
-        .{ encodedOid("1.2.840.10045.3.1.7"), .prime256v1 },
-        .{ encodedOid("1.3.132.0.34"), .secp384r1 },
+    pub const oids = std.ComptimeStringMap(@This(), .{
+        .{ &comptimeOid("1.2.840.10045.3.1.7"), .prime256v1 },
+        .{ &comptimeOid("1.3.132.0.10"), .secp256k1 },
+        .{ &comptimeOid("1.3.132.0.34"), .secp384r1 },
+        .{ &comptimeOid("1.3.132.0.35"), .secp521r1 },
     });
 };
 
-pub const SignatureTag = enum {
-    rsa_sha224,
-    rsa_sha256,
-    rsa_sha384,
-    rsa_sha512,
-    ecdsa_p256_sha224,
-    ecdsa_p256_sha256,
-    ecdsa_p256_sha384,
-    ecdsa_p256_sha512,
-    ecdsa_p384_sha224,
-    ecdsa_p384_sha256,
-    ecdsa_p384_sha384,
-    ecdsa_p384_sha512,
-    ed25519_sha512,
+const AlgorithmTag = enum {
+    rsa_pkcs_sha224,
+    rsa_pkcs_sha256,
+    rsa_pkcs_sha384,
+    rsa_pkcs_sha512,
+    rsa_pss,
+    ecdsa_sha224,
+    ecdsa_sha256,
+    ecdsa_sha384,
+    ecdsa_sha512,
+    ed25519,
 
-    pub fn fromDer(parser: *der.Parser) !SignatureTag {
+    pub const oids = std.ComptimeStringMap(AlgorithmTag, .{
+        .{ &comptimeOid("1.2.840.113549.1.1.14"), .rsa_pkcs_sha224 },
+        .{ &comptimeOid("1.2.840.113549.1.1.11"), .rsa_pkcs_sha256 },
+        .{ &comptimeOid("1.2.840.113549.1.1.12"), .rsa_pkcs_sha384 },
+        .{ &comptimeOid("1.2.840.113549.1.1.13"), .rsa_pkcs_sha512 },
+        .{ &comptimeOid("1.2.840.113549.1.1.10"), .rsa_pss },
+        .{ &comptimeOid("1.2.840.10045.4.3.1"), .ecdsa_sha224 },
+        .{ &comptimeOid("1.2.840.10045.4.3.2"), .ecdsa_sha256 },
+        .{ &comptimeOid("1.2.840.10045.4.3.3"), .ecdsa_sha384 },
+        .{ &comptimeOid("1.2.840.10045.4.3.4"), .ecdsa_sha512 },
+        .{ &comptimeOid("1.3.101.112"), .ed25519 },
+    });
+};
+
+pub const Algorithm = union(enum) {
+    rsa_pkcs: HashTag,
+    rsa_pss: RsaPss,
+    ecdsa: Ecdsa,
+    ed25519: void,
+
+    fn fromDer(parser: *der.Parser) !Algorithm {
         const seq = try parser.nextSequence();
-        defer parser.seekEnd(seq.slice.end);
+        defer parser.seek(seq.slice.end);
 
-        const algo = try parser.nextEnum(Algorithm);
+        const algo = try parser.nextEnum(AlgorithmTag);
         switch (algo) {
-            inline .rsa_sha224,
-            .rsa_sha256,
-            .rsa_sha384,
-            .rsa_sha512,
-            .ed25519_sha512,
+            inline
+            .rsa_pkcs_sha224,
+            .rsa_pkcs_sha256,
+            .rsa_pkcs_sha384,
+            .rsa_pkcs_sha512,
             => |t| {
                 _ = try parser.nextPrimitive(.null);
-                return std.meta.stringToEnum(SignatureTag, @tagName(t)).?;
+                const hash = std.meta.stringToEnum(HashTag, @tagName(t)["rsa_pkcs_".len..]).?;
+                return .{ .rsa_pkcs = hash };
             },
-            .ecdsa_sha224 => {
-                const curve = try parser.nextEnum(NamedCurve);
-                return switch (curve) {
-                    .prime256v1 => .ecdsa_p256_sha224,
-                    .secp384r1 => .ecdsa_p384_sha224,
+            .rsa_pss => return .{ .rsa_pss = try RsaPss.fromDer(parser) },
+            inline
+            .ecdsa_sha224,
+            .ecdsa_sha256,
+            .ecdsa_sha384,
+            .ecdsa_sha512,
+            => |t| {
+                const curve = if (parser.index != seq.slice.end) try parser.nextEnum(NamedCurve) else null;
+                return .{
+                    .ecdsa = Ecdsa{
+                        .hash = std.meta.stringToEnum(HashTag, @tagName(t)["ecdsa_".len..]).?,
+                        .curve = curve,
+                    }
                 };
             },
-            .ecdsa_sha256 => {
-                const curve = try parser.nextEnum(NamedCurve);
-                return switch (curve) {
-                    .prime256v1 => .ecdsa_p256_sha256,
-                    .secp384r1 => .ecdsa_p384_sha256,
-                };
-            },
-            .ecdsa_sha384 => {
-                const curve = try parser.nextEnum(NamedCurve);
-                return switch (curve) {
-                    .prime256v1 => .ecdsa_p256_sha384,
-                    .secp384r1 => .ecdsa_p384_sha384,
-                };
-            },
-            .ecdsa_sha512 => {
-                const curve = try parser.nextEnum(NamedCurve);
-                return switch (curve) {
-                    .prime256v1 => .ecdsa_p256_sha512,
-                    .secp384r1 => .ecdsa_p384_sha512,
-                };
-            },
+            .ed25519 => return .{ .ed25519 = {} },
         }
     }
 
-    const Algorithm = enum {
-        rsa_sha224,
-        rsa_sha256,
-        rsa_sha384,
-        rsa_sha512,
-        ecdsa_sha224,
-        ecdsa_sha256,
-        ecdsa_sha384,
-        ecdsa_sha512,
-        ed25519_sha512,
+    /// Make sure this algorithm is secure.
+    /// Follows version of Mozilla's Certificate policy which additionally disallows SHA1.
+    /// https://www.mozilla.org/en-US/about/governance/policies/security-group/certs/policy/#5-certificates
+    fn validate(self: Algorithm) !void {
+        switch (self) {
+            .rsa_pkcs => |h| try h.validate(),
+            .rsa_pss => |opts| try opts.hash.validate(),
+            .ecdsa => |opts| try opts.hash.validate(),
+            .ed25519 => {}, // always uses sha512
+        }
+    }
 
-        pub const oids = std.ComptimeStringMap(Algorithm, .{
-            .{ encodedOid("1.2.840.113549.1.1.14"), .rsa_sha224 },
-            .{ encodedOid("1.2.840.113549.1.1.11"), .rsa_sha256 },
-            .{ encodedOid("1.2.840.113549.1.1.12"), .rsa_sha384 },
-            .{ encodedOid("1.2.840.113549.1.1.13"), .rsa_sha512 },
-            .{ encodedOid("1.2.840.10045.4.3.1"), .ecdsa_sha224 },
-            .{ encodedOid("1.2.840.10045.4.3.2"), .ecdsa_sha256 },
-            .{ encodedOid("1.2.840.10045.4.3.3"), .ecdsa_sha384 },
-            .{ encodedOid("1.2.840.10045.4.3.4"), .ecdsa_sha512 },
-            .{ encodedOid("1.3.101.112"), .ed25519_sha512 },
-        });
+    // RFC 4055 S3.1
+    const RsaPss = struct {
+        hash: HashTag,
+        mask_gen: MaskGen,
+        salt_len: u8,
+
+        pub fn fromDer(parser: *der.Parser) !RsaPss {
+            const body = try parser.nextSequence();
+            defer parser.seek(body.slice.end);
+
+            const hash = brk: {
+                const seq = try parser.nextSequence();
+                defer parser.seek(seq.slice.end);
+                const hash = try parser.nextEnum(HashTag);
+                _ = try parser.nextPrimitive(.null);
+                break :brk hash;
+            };
+
+            const mask_gen = try MaskGen.fromDer(parser);
+            const salt_len = try parser.nextInt(i8);
+            if (salt_len < 0) return error.InvalidSaltLength;
+
+            return .{ .hash = hash, .mask_gen = mask_gen, .salt_len = @bitCast(salt_len) };
+        }
+
+        const MaskGen = struct {
+            tag: Tag,
+            hash: HashTag,
+
+            pub fn fromDer(parser: *der.Parser) !MaskGen {
+                const seq = try parser.nextSequence();
+                defer parser.seek(seq.slice.end);
+
+                const tag = try parser.nextEnum(Tag);
+                const hash = try parser.nextEnum(HashTag);
+                return .{ .tag = tag, .hash = hash };
+            }
+
+            const Tag = enum {
+                mgf1,
+
+                pub const oids = std.ComptimeStringMap(@This(), .{
+                    .{ &comptimeOid("1.2.840.113549.1.1.8"), .mgf1 },
+                });
+            };
+        };
+    };
+
+    const Ecdsa = struct {
+        hash: HashTag,
+        curve: ?NamedCurve,
     };
 };
 
-/// Currently supports TLS signature schemes.
-/// https://www.iana.org/assignments/tls-parameters/tls-parameters.xhtml#tls-signaturescheme
-pub const Signature = union(enum) {
-    rsa2048_sha224: Rsa2048.PKCS1v1_5(sha2.Sha224).Signature,
-    rsa2048_sha256: Rsa2048.PKCS1v1_5(sha2.Sha256).Signature,
-    rsa2048_sha384: Rsa2048.PKCS1v1_5(sha2.Sha384).Signature,
-    rsa2048_sha512: Rsa2048.PKCS1v1_5(sha2.Sha512).Signature,
-    rsa4096_sha224: Rsa4096.PKCS1v1_5(sha2.Sha224).Signature,
-    rsa4096_sha256: Rsa4096.PKCS1v1_5(sha2.Sha256).Signature,
-    rsa4096_sha384: Rsa4096.PKCS1v1_5(sha2.Sha384).Signature,
-    rsa4096_sha512: Rsa4096.PKCS1v1_5(sha2.Sha512).Signature,
-    ecdsa_p256_sha256: crypto.sign.ecdsa.EcdsaP256Sha256.Signature,
-    ecdsa_p384_sha384: crypto.sign.ecdsa.EcdsaP384Sha384.Signature,
-    ed25519_sha512: crypto.sign.Ed25519.Signature,
+const HashTag = enum {
+    sha1,
+    sha224,
+    sha256,
+    sha384,
+    sha512,
+    sha512_224,
+    sha512_256,
 
-    pub fn fromPubKey(tag: SignatureTag, key: PubKey, bitstring: der.BitString) !Signature {
+    pub const oids = std.ComptimeStringMap(@This(), .{
+        .{ &comptimeOid("1.3.14.3.2.26"), .sha1 },
+        .{ &comptimeOid("2.16.840.1.101.3.4.2.1"), .sha256 },
+        .{ &comptimeOid("2.16.840.1.101.3.4.2.2"), .sha384 },
+        .{ &comptimeOid("2.16.840.1.101.3.4.2.3"), .sha512 },
+        .{ &comptimeOid("2.16.840.1.101.3.4.2.4"), .sha224 },
+        .{ &comptimeOid("2.16.840.1.101.3.4.2.5"), .sha512_224 },
+        .{ &comptimeOid("2.16.840.1.101.3.4.2.6"), .sha512_256 },
+    });
+
+    /// Returns error if not secure.
+    pub fn validate(tag: HashTag) !void {
         switch (tag) {
-            inline .rsa_sha224, .rsa_sha256, .rsa_sha384, .rsa_sha512 => |sig_tag| {
-                const hash = @tagName(sig_tag)["rsa_".len..];
-                switch (key) {
-                    inline .rsa2048, .rsa4096 => |_, fam_tag| return fromTag(@tagName(fam_tag) ++ "_" ++ hash, bitstring),
-                    else => return error.SignaturePubKeyMismatch,
-                }
-            },
-            inline .ecdsa_p256_sha224,
-            .ecdsa_p256_sha256,
-            .ecdsa_p256_sha384,
-            .ecdsa_p256_sha512,
-            .ecdsa_p384_sha224,
-            .ecdsa_p384_sha256,
-            .ecdsa_p384_sha384,
-            .ecdsa_p384_sha512,
-            => |sig_tag| {
-                const hash = @tagName(sig_tag)["ecdsa_p384_".len..];
-                switch (key) {
-                    inline .ecdsa_p256, .ecdsa_p384 => |_, fam_tag| return fromTag(@tagName(fam_tag) ++ "_" ++ hash, bitstring),
-                    else => return error.SignaturePubKeyMismatch,
-                }
-            },
-            .ed25519_sha512 => switch (key) {
-                inline .ed25519 => return fromTag("ed25519_sha512", bitstring),
-                else => return error.SignaturePubKeyMismatch,
-            },
+            .sha1 => return error.InsecureHash,
+            else => {},
         }
     }
 
-    fn fromTag(comptime sig_tag: []const u8, bitstring: der.BitString) !Signature {
-        const SigT = std.meta.TagPayloadByName(Signature, sig_tag);
-        if (bitstring.bytes.len - bitstring.right_padding != SigT.encoded_length)
-            return error.InvalidSignatureLen;
-        const sig = SigT.fromBytes(bitstring.bytes[0..SigT.encoded_length].*);
-        return @unionInit(Signature, sig_tag, sig);
+    pub fn Hash(comptime self: HashTag) type {
+        return switch (self) {
+            .sha1 => return crypto.hash.Sha1,
+            .sha224 => return crypto.hash.sha2.Sha224,
+            .sha256 => return crypto.hash.sha2.Sha256,
+            .sha384 => return crypto.hash.sha2.Sha384,
+            .sha512 => return crypto.hash.sha2.Sha512,
+            .sha512_224 => return crypto.hash.sha2.Sha512_224,
+            .sha512_256 => return crypto.hash.sha2.Sha512_256,
+        };
     }
+};
 
-    pub const VerifyError = error{InvalidSignature};
+pub const Signature = struct {
+    algo: Algorithm,
+    value: Value,
+
+    const Value = union(PubKeyTag) {
+        rsa2048: Rsa2048.Signature,
+        rsa3072: Rsa3072.Signature,
+        rsa4096: Rsa4096.Signature,
+        ecdsa_p256: EcdsaP256.Signature,
+        ecdsa_p384: EcdsaP384.Signature,
+        ecdsa_secp256: EcdsaSecP256.Signature,
+        ed25519: Ed25519.Signature,
+
+        pub fn fromBitString(tag: PubKeyTag, bitstring: der.BitString) !Value {
+            if (bitstring.right_padding != 0) return error.InvalidSignature;
+            var parser = der.Parser{ .bytes = bitstring.bytes };
+
+            switch (tag) {
+                inline else => |t| {
+                    const T = std.meta.FieldType(@This(), t);
+                    const value = try T.fromDer(&parser);
+                    return @unionInit(Value, @tagName(t), value);
+                },
+            }
+        }
+    };
 
     /// Verifies that this signature matches from `message` signed by `pub_key`
-    pub fn verify(self: Signature, message: []const u8, pub_key: PubKey) Signature.VerifyError!void {
-        switch (self) {
-            inline .rsa2048_sha224,
-            .rsa2048_sha256,
-            .rsa2048_sha384,
-            .rsa2048_sha512,
-            .rsa4096_sha224,
-            .rsa4096_sha256,
-            .rsa4096_sha384,
-            .rsa4096_sha512,
-            => |sig| {
-                switch (pub_key) {
-                    inline .rsa2048, .rsa4096 => |pk| {
-                        sig.verify(message, pk) catch return error.PublicKeyMismatch;
+    pub fn verify(self: Signature, message: []const u8, pub_key: PubKey) !void {
+        if (std.meta.activeTag(pub_key) != std.meta.activeTag(self.value)) return error.PublicKeyMismatch;
+
+        switch (self.value) {
+            .rsa2048, .rsa3072, .rsa4096 => |sig| {
+                switch (self.algo) {
+                    .rsa_pkcs => |hash| {
+                        const Hash = switch (hash) {
+                            inline else => |h| h.Hash(),
+                        };
+                        try sig.value.pss(Hash).verify(message, pub_key);
                     },
-                    else => return error.PublicKeyMismatch,
+                    .rsa_pss => |opts| {
+                        const Hash = switch (opts.hash) {
+                            inline else => |h| h.Hash(),
+                        };
+                        if (opts.mask_gen != .mgf1) return error.UnsupportedMaskGenerationFunction;
+                        try sig.value.pss(Hash).verify(message, pub_key, opts.salt_len);
+                    },
+                    else => return error.AlgorithmMismatch,
                 }
             },
-            inline .ecdsa_p256_sha224,
-            .ecdsa_p256_sha256,
-            .ecdsa_p256_sha384,
-            .ecdsa_p256_sha512,
-            .ecdsa_p384_sha224,
-            .ecdsa_p384_sha256,
-            .ecdsa_p384_sha384,
-            .ecdsa_p384_sha512,
-            => |sig| {
-                switch (pub_key) {
-                    inline .ecdsa_p256, .ecdsa_p384 => |pk| {
-                        sig.verify(message, pk) catch |err| switch (err) {
-                            error.IdentityElement,
-                            error.NonCanonical,
-                            error.SignatureVerificationFailed,
-                            => return error.InvalidSignature,
-                        };
+            .ecdsa_p256, .ecdsa_p384, .ecdsa_secp256 => |sig| {
+                switch (self.algo) {
+                    .ecdsa => |opts| {
+                        try sig.verify(opts.hash, message, pub_key);
                     },
-                    else => return error.PublicKeyMismatch,
+                    else => return error.AlgorithmMismatch,
                 }
             },
             .ed25519_sha512 => |sig| {
-                switch (pub_key) {
-                    inline .ed25519 => |pk| {
-                        sig.verify(message, pk) catch |err| switch (err) {
-                            error.IdentityElement,
-                            error.NonCanonical,
-                            error.SignatureVerificationFailed,
-                            error.InvalidEncoding,
-                            error.WeakPublicKey,
-                            => return error.InvalidSignature,
-                        };
-                    },
-                    else => return error.PublicKeyMismatch,
-                }
+                try sig.verify(message, pub_key);
             },
         }
     }
@@ -668,18 +742,18 @@ pub const Attribute = enum {
     domainComponent,
 
     pub const oids = std.ComptimeStringMap(Attribute, .{
-        .{ encodedOid("2.5.4.3"), .common_nameName },
-        .{ encodedOid("2.5.4.5"), .serialNumber },
-        .{ encodedOid("2.5.4.6"), .countryName },
-        .{ encodedOid("2.5.4.7"), .localityName },
-        .{ encodedOid("2.5.4.8"), .stateOrProvinceName },
-        .{ encodedOid("2.5.4.9"), .streetAddress },
-        .{ encodedOid("2.5.4.10"), .organizationName },
-        .{ encodedOid("2.5.4.11"), .organizationalUnitName },
-        .{ encodedOid("2.5.4.17"), .postalCode },
-        .{ encodedOid("2.5.4.97"), .organizationIdentifier },
-        .{ encodedOid("1.2.840.113549.1.9.1"), .pkcs9_emailAddress },
-        .{ encodedOid("0.9.2342.19200300.100.1.25"), .domainComponent },
+        .{ &comptimeOid("2.5.4.3"), .common_nameName },
+        .{ &comptimeOid("2.5.4.5"), .serialNumber },
+        .{ &comptimeOid("2.5.4.6"), .countryName },
+        .{ &comptimeOid("2.5.4.7"), .localityName },
+        .{ &comptimeOid("2.5.4.8"), .stateOrProvinceName },
+        .{ &comptimeOid("2.5.4.9"), .streetAddress },
+        .{ &comptimeOid("2.5.4.10"), .organizationName },
+        .{ &comptimeOid("2.5.4.11"), .organizationalUnitName },
+        .{ &comptimeOid("2.5.4.17"), .postalCode },
+        .{ &comptimeOid("2.5.4.97"), .organizationIdentifier },
+        .{ &comptimeOid("1.2.840.113549.1.9.1"), .pkcs9_emailAddress },
+        .{ &comptimeOid("0.9.2342.19200300.100.1.25"), .domainComponent },
     });
 };
 
@@ -723,12 +797,12 @@ pub const KeyUsageExt = struct {
         ocsp_signing,
 
         pub const oids = std.ComptimeStringMap(Tag, .{
-            .{ encodedOid("1.3.6.1.5.5.7.3.1"), .server_auth },
-            .{ encodedOid("1.3.6.1.5.5.7.3.2"), .client_auth },
-            .{ encodedOid("1.3.6.1.5.5.7.3.3"), .code_signing },
-            .{ encodedOid("1.3.6.1.5.5.7.3.4"), .email_protection },
-            .{ encodedOid("1.3.6.1.5.5.7.3.8"), .time_stamping },
-            .{ encodedOid("1.3.6.1.5.5.7.3.9"), .ocsp_signing },
+            .{ &comptimeOid("1.3.6.1.5.5.7.3.1"), .server_auth },
+            .{ &comptimeOid("1.3.6.1.5.5.7.3.2"), .client_auth },
+            .{ &comptimeOid("1.3.6.1.5.5.7.3.3"), .code_signing },
+            .{ &comptimeOid("1.3.6.1.5.5.7.3.4"), .email_protection },
+            .{ &comptimeOid("1.3.6.1.5.5.7.3.8"), .time_stamping },
+            .{ &comptimeOid("1.3.6.1.5.5.7.3.9"), .ocsp_signing },
         });
     };
 
@@ -736,7 +810,7 @@ pub const KeyUsageExt = struct {
         var res: KeyUsageExt = .{};
 
         const seq = try parser.nextSequence();
-        defer parser.seekEnd(seq.slice.end);
+        defer parser.seek(seq.slice.end);
         while (parser.index != parser.bytes.len) {
             const tag = parser.nextEnum(KeyUsageExt.Tag) catch |err| switch (err) {
                 error.UnknownObjectId => continue,
@@ -769,29 +843,6 @@ pub const GeneralNameTag = enum(u5) {
     _,
 };
 
-fn verifyEd25519(
-    message: []const u8,
-    encoded_sig: []const u8,
-    pub_key_algo: Cert.PubKeyAlgo,
-    encoded_pub_key: []const u8,
-) !void {
-    if (pub_key_algo != .curveEd25519) return error.CertificateSignatureAlgorithmMismatch;
-    const Ed25519 = crypto.sign.Ed25519;
-    if (encoded_sig.len != Ed25519.Signature.encoded_length) return error.CertificateSignatureInvalid;
-    const sig = Ed25519.Signature.fromBytes(encoded_sig[0..Ed25519.Signature.encoded_length].*);
-    if (encoded_pub_key.len != Ed25519.PublicKey.encoded_length) return error.CertificateSignatureInvalid;
-    const pub_key = Ed25519.PublicKey.fromBytes(encoded_pub_key[0..Ed25519.PublicKey.encoded_length].*) catch |err| switch (err) {
-        error.NonCanonical => return error.CertificateSignatureInvalid,
-    };
-    sig.verify(message, pub_key) catch |err| switch (err) {
-        error.IdentityElement => return error.CertificateSignatureInvalid,
-        error.NonCanonical => return error.CertificateSignatureInvalid,
-        error.SignatureVerificationFailed => return error.CertificateSignatureInvalid,
-        error.InvalidEncoding => return error.CertificateSignatureInvalid,
-        error.WeakPublicKey => return error.CertificateSignatureInvalid,
-    };
-}
-
 fn nextDirString(parser: *der.Parser) ![]const u8 {
     const ele = try parser.next(.universal, false, null);
     switch (ele.identifier.tag) {
@@ -802,10 +853,15 @@ fn nextDirString(parser: *der.Parser) ![]const u8 {
     }
 }
 
-fn encodedOid(comptime bytes: []const u8) []const u8 {
-    @setEvalBranchQuota(10000);
-    const oid = Oid.fromDot(bytes) catch unreachable;
-    return oid.bytes;
+fn comptimeOidFromString(comptime bytes: []const u8) Oid {
+    @setEvalBranchQuota(10_000);
+    var buf: [256]u8 = undefined;
+    return Oid.fromString(bytes, &buf) catch unreachable;
+}
+
+fn comptimeOid(comptime bytes: []const u8) [comptimeOidFromString(bytes).bytes.len]u8 {
+    const oid = comptimeOidFromString(bytes);
+    return oid.bytes[0..oid.bytes.len].*;
 }
 
 const std = @import("../std.zig");
@@ -816,10 +872,18 @@ const Certificate = @This();
 const der = @import("der.zig");
 const Oid = der.Oid;
 const rsa = @import("rsa.zig");
-const Rsa2048 = crypto.rsa.Rsa2048;
-const Rsa4096 = crypto.rsa.Rsa4096Sha512;
+const ecdsa = crypto.sign.ecdsa;
+const sha2 = crypto.hash.sha2;
 const testing = std.testing;
 pub const Bundle = @import("Certificate/Bundle.zig");
+
+const Rsa2048 = rsa.Rsa2048;
+const Rsa3072 = rsa.Rsa3072;
+const Rsa4096 = rsa.Rsa4096;
+const EcdsaP256 = ecdsa.Ecdsa(crypto.ecc.P256);
+const EcdsaP384 = ecdsa.Ecdsa(crypto.ecc.P384);
+const EcdsaSecP256 = ecdsa.Ecdsa(crypto.ecc.Secp256k1);
+const Ed25519 = crypto.sign.Ed25519;
 
 test {
     _ = Bundle;
@@ -833,7 +897,7 @@ inline fn hexToBytes(comptime hex: []const u8) []u8 {
 
 test fromDer {
     // exact same cert as https://tls13.xargs.org/certificate.html
-    // can also verify with `openssl`
+    // can also verify with:
     // $ openssl x509 -inform der -in ./testdata/cert.der -noout -text
     const cert_bytes = @embedFile("testdata/cert.der");
     const cert = try Cert.fromDer(cert_bytes);
@@ -847,7 +911,14 @@ test fromDer {
     try testing.expectEqualStrings("US", cert.subject.country);
     try testing.expectEqualStrings("example.ulfheim.net", cert.subject.common_name);
     try testing.expectEqual(PubKey.rsa2048, std.meta.activeTag(cert.pub_key));
-    try testing.expectEqual(@as(usize, 65537), try cert.pub_key.rsa2048.e.toPrimitive(usize));
-    try testing.expectEqual(Signature.rsa2048_sha256, std.meta.activeTag(cert.signature));
-    try testing.expectEqualSlices(u8, &[_]u8{ 0x59, 0x16 }, cert.signature.rsa2048_sha256.bytes[0..2]);
+    try testing.expectEqual(@as(usize, 65537), try cert.pub_key.rsa2048.public_exponent.toPrimitive(usize));
+    try testing.expectEqual(Algorithm{ .rsa_pkcs = .sha256 }, cert.signature.algo);
+    try testing.expectEqualSlices(u8, &[_]u8{ 0x59, 0x16 }, cert.signature.value.rsa2048.bytes[0..2]);
+}
+
+test "fromDer ecda" {
+    const cert_bytes = @embedFile("testdata/cert_ecdsa.der");
+    const cert = try Cert.fromDer(cert_bytes);
+
+    try testing.expectEqual(Version.v3, cert.version);
 }

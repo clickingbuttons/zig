@@ -1,3 +1,8 @@
+//! Secure Hashing Algorithm 2
+//!
+//! Set of cryptographic hash functions designed by the NSA.
+//!
+//! See https://nvlpubs.nist.gov/nistpubs/FIPS/NIST.FIPS.180-4.pdf
 const std = @import("../std.zig");
 const builtin = @import("builtin");
 const mem = std.mem;
@@ -71,10 +76,7 @@ const Sha256Params = Sha2Params32{
 
 const v4u32 = @Vector(4, u32);
 
-/// SHA-224
 pub const Sha224 = Sha2x32(Sha224Params);
-
-/// SHA-256
 pub const Sha256 = Sha2x32(Sha256Params);
 
 fn Sha2x32(comptime params: Sha2Params32) type {
@@ -533,7 +535,7 @@ const Sha512Params = Sha2Params64{
     .digest_bits = 512,
 };
 
-const Sha512224Params = Sha2Params64{
+const Sha512_224Params = Sha2Params64{
     .iv0 = 0x8C3D37C819544DA2,
     .iv1 = 0x73E1996689DCD4D6,
     .iv2 = 0x1DFAB7AE32FF9C82,
@@ -545,7 +547,7 @@ const Sha512224Params = Sha2Params64{
     .digest_bits = 224,
 };
 
-const Sha512256Params = Sha2Params64{
+const Sha512_256Params = Sha2Params64{
     .iv0 = 0x22312194FC2BF72C,
     .iv1 = 0x9F555FA3C84C64C2,
     .iv2 = 0x2393B86B6F53B151,
@@ -569,19 +571,10 @@ const Sha512T256Params = Sha2Params64{
     .digest_bits = 256,
 };
 
-/// SHA-384
 pub const Sha384 = Sha2x64(Sha384Params);
-
-/// SHA-512
 pub const Sha512 = Sha2x64(Sha512Params);
-
-/// SHA-512/224
-pub const Sha512224 = Sha2x64(Sha512224Params);
-
-/// SHA-512/256
-pub const Sha512256 = Sha2x64(Sha512256Params);
-
-/// Truncated SHA-512
+pub const Sha512_224 = Sha2x64(Sha512_224Params);
+pub const Sha512_256 = Sha2x64(Sha512_256Params);
 pub const Sha512T256 = Sha2x64(Sha512T256Params);
 
 fn Sha2x64(comptime params: Sha2Params64) type {
@@ -901,22 +894,22 @@ test "sha512 aligned final" {
 
 test "sha512-224 single" {
     const h1 = "6ed0dd02806fa89e25de060c19d3ac86cabb87d6a0ddd05c333b84f4";
-    try htest.assertEqualHash(Sha512224, h1, "");
+    try htest.assertEqualHash(Sha512_224, h1, "");
 
     const h2 = "4634270f707b6a54daae7530460842e20e37ed265ceee9a43e8924aa";
-    try htest.assertEqualHash(Sha512224, h2, "abc");
+    try htest.assertEqualHash(Sha512_224, h2, "abc");
 
     const h3 = "23fec5bb94d60b23308192640b0c453335d664734fe40e7268674af9";
-    try htest.assertEqualHash(Sha512224, h3, "abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmnhijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu");
+    try htest.assertEqualHash(Sha512_224, h3, "abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmnhijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu");
 }
 
 test "sha512-256 single" {
     const h1 = "c672b8d1ef56ed28ab87c3622c5114069bdd3ad7b8f9737498d0c01ecef0967a";
-    try htest.assertEqualHash(Sha512256, h1, "");
+    try htest.assertEqualHash(Sha512_256, h1, "");
 
     const h2 = "53048e2681941ef99b2e29b76b4c7dabe4c2d0c634fc6d46e0e2f13107e7af23";
-    try htest.assertEqualHash(Sha512256, h2, "abc");
+    try htest.assertEqualHash(Sha512_256, h2, "abc");
 
     const h3 = "3928e184fb8690f840da3988121d31be65cb9d3ef83ee6146feac861e19b563a";
-    try htest.assertEqualHash(Sha512256, h3, "abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmnhijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu");
+    try htest.assertEqualHash(Sha512_256, h3, "abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmnhijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu");
 }

@@ -3,6 +3,7 @@ const crypto = std.crypto;
 const debug = std.debug;
 const fmt = std.fmt;
 const mem = std.mem;
+const der = crypto.der;
 
 const Sha512 = crypto.hash.sha2.Sha512;
 
@@ -210,6 +211,21 @@ pub const Ed25519 = struct {
             return Signature{
                 .r = bytes[0..Curve.encoded_length].*,
                 .s = bytes[Curve.encoded_length..].*,
+            };
+        }
+
+        pub fn fromDer(parser: *der.Parser) !Signature {
+            const seq = try parser.nextSequence();
+            defer parser.seek(seq.slice.end);
+
+            const r = try parser.nextPrimitive(.integer);
+            if (r.slice.len() != Curve.encoded_length) return error.InvalidScalarR;
+            const s = try parser.nextPrimitive(.integer);
+            if (s.slice.len() != @sizeOf(CompressedScalar)) return error.InvalidScalarS;
+
+            return Signature{
+                .r = parser.view(r)[0..Curve.encoded_length].*,
+                .s = parser.view(s)[0..@sizeOf(CompressedScalar)].*,
             };
         }
 

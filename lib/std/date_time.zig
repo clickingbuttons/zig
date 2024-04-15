@@ -65,6 +65,7 @@ pub const DateTime = DateTimeAdvanced(date_mod.Date, time_mod.Time);
 
 comptime {
     assert(@sizeOf(DateTime) == 8);
+    assert(DateTime.EpochSubseconds == i49);
 }
 
 /// Tests EpochSeconds -> DateTime and DateTime -> EpochSeconds

@@ -51,7 +51,7 @@ pub const Parser = struct {
                 var date: DateTime.Date = undefined;
                 date.year = try parseTimeDigits(bytes[0..2], 0, 99);
                 date.year += if (date.year >= 50) 1900 else 2000;
-                date.month = try parseTimeDigits(bytes[2..4], 1, 12);
+                date.month = @enumFromInt(try parseTimeDigits(bytes[2..4], 1, 12));
                 date.day = try parseTimeDigits(bytes[4..6], 1, 31);
                 const time = try parseTime(bytes[6..12]);
 
@@ -66,7 +66,7 @@ pub const Parser = struct {
 
                 var date: DateTime.Date = undefined;
                 date.year = try parseYear4(bytes[0..4]);
-                date.month = try parseTimeDigits(bytes[4..6], 1, 12);
+                date.month = @enumFromInt(try parseTimeDigits(bytes[4..6], 1, 12));
                 date.day = try parseTimeDigits(bytes[6..8], 1, 31);
                 const time = try parseTime(bytes[10..16]);
 
@@ -91,6 +91,29 @@ pub const Parser = struct {
 
     pub fn nextPrimitive(self: *Parser, tag: ?Identifier.Tag) !Element {
         return try self.next(.universal, false, tag);
+    }
+
+    pub fn nextInteger(self: *Parser) !Element {
+        var elem = try self.nextPrimitive(.integer);
+        if (elem.slice.len() > 0) {
+            if (self.view(elem)[0] == 0) elem.slice.start += 1;
+            if (elem.slice.len() > 0 and self.view(elem)[0] == 0) return error.InvalidIntegerEncoding;
+        }
+        return elem;
+    }
+
+    pub fn nextInt(self: *Parser, comptime T: type) !T {
+        const int = try self.nextInteger();
+        const bytes = self.view(int);
+        switch (@typeInfo(T)) {
+            .Int => |info| {
+                if (info.bits % 8 != 0) @compileError("DER only supports bytes");
+                if (info.signedness != .signed) @compileError("DER only supports signed ints");
+
+                return std.mem.readInt(T, bytes[0..info.bits / 8], .little);
+            },
+            else => @compileError(@typeName(T) ++ " is not an int type"),
+        }
     }
 
     pub fn next(
@@ -141,21 +164,23 @@ pub const Element = struct {
         }
     };
 
-    pub const ParseError = error{InvalidLength};
+    pub fn init(bytes: []const u8, index: u32) !Element {
+        if (bytes[index..].len < 2) return error.InvalidElement;
 
-    pub fn init(bytes: []const u8, index: u32) ParseError!Element {
         var i = index;
         const identifier = @as(Identifier, @bitCast(bytes[i]));
         i += 1;
         const size_byte = bytes[i];
         i += 1;
+
+        var end = i;
         if ((size_byte >> 7) == 0) {
+            end += size_byte;
+            if (end > bytes.len) return error.InvalidLength;
+
             return .{
                 .identifier = identifier,
-                .slice = .{
-                    .start = i,
-                    .end = i + size_byte,
-                },
+                .slice = .{ .start = i, .end = end },
             };
         }
 
@@ -163,17 +188,19 @@ pub const Element = struct {
         if (len_size > @sizeOf(u32)) return error.InvalidLength;
 
         const end_i = i + len_size;
+        if (end_i > bytes.len) return error.InvalidElement;
         var long_form_size: u32 = 0;
         while (i < end_i) : (i += 1) {
             long_form_size = (long_form_size << 8) | bytes[i];
         }
 
+        if (long_form_size <= (1 << 7)) return error.InvalidEncoding; // long form should be short form
+        end = std.math.add(u32, i, long_form_size) catch return error.InvalidEncoding;
+
+        if (end > bytes.len) return error.InvalidLength;
         return .{
             .identifier = identifier,
-            .slice = .{
-                .start = i,
-                .end = i + long_form_size,
-            },
+            .slice = .{ .start = i, .end = end },
         };
     }
 };
@@ -202,17 +229,17 @@ test parseTimeDigits {
     try expectError(error.InvalidTime, parseTimeDigits("Di", 0, 99));
 }
 
-fn parseYear4(text: *const [4]u8) !u16 {
-    const result = std.fmt.parseInt(u16, text, 10) catch return error.InvalidYear;
+fn parseYear4(text: *const [4]u8) !i16 {
+    const result = std.fmt.parseInt(i16, text, 10) catch return error.InvalidYear;
     if (result > 9999) return error.InvalidYear;
     return result;
 }
 
 test parseYear4 {
     const expectEqual = std.testing.expectEqual;
-    try expectEqual(@as(u16, 0), try parseYear4("0000"));
-    try expectEqual(@as(u16, 9999), try parseYear4("9999"));
-    try expectEqual(@as(u16, 1988), try parseYear4("1988"));
+    try expectEqual(@as(i16, 0), try parseYear4("0000"));
+    try expectEqual(@as(i16, 9999), try parseYear4("9999"));
+    try expectEqual(@as(i16, 1988), try parseYear4("1988"));
 
     const expectError = std.testing.expectError;
     try expectError(error.InvalidYear, parseYear4("999b"));
@@ -295,17 +322,13 @@ pub const Oid = struct {
         return res;
     }
 
-    pub inline fn fromDot(dot_notation: []const u8) !Oid {
-        // technically infinite length, 256 is a generous upper bound that can hold
-        // the longest standard value
-        var res: [256]u8 = undefined;
-
+    pub fn fromString(dot_notation: []const u8, buf: []u8) !Oid {
         var split = std.mem.splitScalar(u8, dot_notation, '.');
         // optimization: store first two numbers in first byte
         const first = try std.fmt.parseInt(u8, split.next().?, 10);
         const second = try std.fmt.parseInt(u8, split.next().?, 10);
 
-        res[0] = first * 40 + second;
+        buf[0] = first * 40 + second;
 
         var i: usize = 1;
         while (split.next()) |s| {
@@ -318,19 +341,19 @@ pub const Oid = struct {
                 const place = std.math.pow(usize, oid_base, n_bytes - j);
                 const digit: u8 = @intCast(@divFloor(parsed, place));
 
-                res[i] = digit | 0b10000000;
+                buf[i] = digit | 0b10000000;
                 parsed -= digit * place;
 
                 i += 1;
             }
-            res[i] = @intCast(parsed);
+            buf[i] = @intCast(parsed);
             i += 1;
         }
 
-        return .{ .bytes = res[0..i] };
+        return .{ .bytes = buf[0..i] };
     }
 
-    pub fn toDecimal(self: Oid, writer: std.io.AnyWriter) !void {
+    pub fn toString(self: Oid, writer: std.io.AnyWriter) !void {
         const first = @divTrunc(self.bytes[0], 40);
         const second = self.bytes[0] - first * 40;
         try writer.print("{d}.{d}", .{ first, second });
@@ -359,11 +382,12 @@ pub const Oid = struct {
 };
 
 fn testOid(expected: []const u8, dot_notation: []const u8) !void {
-    const oid = try Oid.fromDot(dot_notation);
+    var buf: [256]u8 = undefined;
+    const oid = try Oid.fromString(dot_notation, &buf);
     try std.testing.expectEqualSlices(u8, expected, oid.bytes);
     var dotted_notation_buf: [256]u8 = undefined;
     var stream = std.io.fixedBufferStream(&dotted_notation_buf);
-    try oid.toDecimal(stream.writer().any());
+    try oid.toString(stream.writer().any());
     try std.testing.expectEqualStrings(dot_notation, stream.getWritten());
 }
 
@@ -383,8 +407,8 @@ test Oid {
     );
     try testOid(&[_]u8{ 0x2b, 0x65, 0x70 }, "1.3.101.112");
 
-    // const idk = [_]u8{0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x04};
-    // const oid = Oid{ .bytes = &idk };
+    // const idk = hexToBytes("300d06092a864886f70d01010c0500");
+    // const oid = Oid{ .bytes = idk };
     // var stream = std.io.getStdErr();
     // try oid.toDecimal(stream.writer().any());
     // try stream.writer().writeAll("\n");
