@@ -328,7 +328,7 @@ pub fn Rsa(comptime modulus_bits: usize) type {
                         var hash: [Hash.digest_length]u8 = undefined;
                         self.h.final(&hash);
 
-                        var em = emsaEncode(hash);
+                        var em = try emsaEncode(hash);
                         self.key_pair.encrypt(&em, &em) catch unreachable;
                         return .{ .bytes = em };
                     }
@@ -362,46 +362,56 @@ pub fn Rsa(comptime modulus_bits: usize) type {
                         var hash: [Hash.digest_length]u8 = undefined;
                         self.h.final(&hash);
 
-                        const expected = emsaEncode(hash);
+                        const expected = try emsaEncode(hash);
 
                         if (!std.mem.eql(u8, &expected, &em)) return error.Inconsistent;
                     }
                 };
 
                 /// Encrypted Message Signature Appendix
-                fn emsaEncode(hash: [Hash.digest_length]u8) [modulus_len]u8 {
+                fn emsaEncode(hash: [Hash.digest_length]u8) ![modulus_len]u8 {
                     const digest_header = digestHeader();
                     const tLen = digest_header.len + Hash.digest_length;
                     const emLen = modulus_len;
-                    if (emLen < tLen + 11) @compileError("modulus_len too short");
+                    if (emLen < tLen + 11) return error.ModulusTooShort;
 
-                    return [_]u8{ 0, 1 } ++
-                        ([_]u8{0xff} ** (emLen - tLen - 3)) ++
-                        [_]u8{0} ++
-                        digest_header ++
-                        hash;
+                    var res: [modulus_len]u8 = undefined;
+                    res[0] = 0;
+                    res[1] = 1;
+                    const padding_len = emLen - tLen - 3;
+                    @memset(res[2..][0..padding_len], 0xff);
+                    res[2 + padding_len] = 0;
+                    @memcpy(res[2 + padding_len + 1..][0..digest_header.len], digest_header);
+                    @memcpy(res[res.len - hash.len..], &hash);
+
+                    return res;
                 }
 
                 /// DER encoded header. Sequence of digest algo + digest.
-                fn digestHeader() [19]u8 {
+                fn digestHeader() []const u8 {
                     const sha2 = std.crypto.hash.sha2;
+                    // Section 9.2 Notes 1.
                     return switch (Hash) {
-                        sha2.Sha224 => [_]u8{
+                        std.crypto.hash.Sha1 => &[_]u8{
+                            0x30, 0x21, 0x30, 0x09, 0x06, 0x05, 0x2b, 0x0e,
+                            0x03, 0x02, 0x1a, 0x05, 0x00, 0x04, 0x14
+                        },
+                        sha2.Sha224 => &[_]u8{
                             0x30, 0x2d, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86,
                             0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x04, 0x05,
                             0x00, 0x04, 0x1c,
                         },
-                        sha2.Sha256 => [_]u8{
+                        sha2.Sha256 => &[_]u8{
                             0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86,
                             0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01, 0x05,
                             0x00, 0x04, 0x20,
                         },
-                        sha2.Sha384 => [_]u8{
+                        sha2.Sha384 => &[_]u8{
                             0x30, 0x41, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86,
                             0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x02, 0x05,
                             0x00, 0x04, 0x30,
                         },
-                        sha2.Sha512 => [_]u8{
+                        sha2.Sha512 => &[_]u8{
                             0x30, 0x51, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86,
                             0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x03, 0x05,
                             0x00, 0x04, 0x40,

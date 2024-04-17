@@ -159,20 +159,26 @@ pub fn addCertsFromFile(cb: *Bundle, gpa: Allocator, file: fs.File) !void {
     const end_reserved: u32 = @intCast(cb.bytes.items.len + decoded_size_upper_bound);
     const buffer = cb.bytes.allocatedSlice()[end_reserved..];
     const end_index = try file.readAll(buffer);
-    const encoded_bytes = buffer[0..end_index];
+    const pem = buffer[0..end_index];
 
+    return try cb.addCertsFromPem(gpa, pem);
+}
+
+pub fn addCertsFromPem(cb: *Bundle, gpa: Allocator, pem: []const u8) !void {
     const begin_marker = "-----BEGIN CERTIFICATE-----";
     const end_marker = "-----END CERTIFICATE-----";
 
     const now_sec = std.time.timestamp();
+    const decoded_size_upper_bound = pem.len / 4 * 3;
+    try cb.bytes.ensureUnusedCapacity(gpa, pem.len + decoded_size_upper_bound);
 
     var start_index: usize = 0;
-    while (mem.indexOfPos(u8, encoded_bytes, start_index, begin_marker)) |begin_marker_start| {
+    while (mem.indexOfPos(u8, pem, start_index, begin_marker)) |begin_marker_start| {
         const cert_start = begin_marker_start + begin_marker.len;
-        const cert_end = mem.indexOfPos(u8, encoded_bytes, cert_start, end_marker) orelse
+        const cert_end = mem.indexOfPos(u8, pem, cert_start, end_marker) orelse
             return error.MissingEndCertificateMarker;
         start_index = cert_end + end_marker.len;
-        const encoded_cert = mem.trim(u8, encoded_bytes[cert_start..cert_end], " \t\r\n");
+        const encoded_cert = mem.trim(u8, pem[cert_start..cert_end], " \t\r\n");
         const decoded_start: u32 = @intCast(cb.bytes.items.len);
         const dest_buf = cb.bytes.allocatedSlice()[decoded_start..];
         cb.bytes.items.len += try base64.decode(dest_buf, encoded_cert);
@@ -182,7 +188,38 @@ pub fn addCertsFromFile(cb: *Bundle, gpa: Allocator, file: fs.File) !void {
 
 pub fn parseCert(cb: *Bundle, gpa: Allocator, decoded_start: u32, now_sec: i64) !void {
     const cert = Certificate.fromDer(cb.bytes.items[decoded_start..]) catch |err| {
-        log.warn("skipping cert {}", .{ err });
+        // may lead to valid certificates appearing invalid
+        log.warn("could not parse cert: {}", .{ err });
+        return;
+    };
+    cert.signature_algo.verify() catch |err| {
+        std.debug.assert(err == error.InsecureHash);
+        // The cert bundler kept these certs so that implementations supporting
+        // insecure signature algorithms can update their cert bundle
+        // without breaking compatibility.
+        //
+        // Since we're a new implementation that doesn't support insecure
+        // signature algorithms (and `verify` will never pass them), skip them.
+        var serial_number_buf: [48]u8 = undefined; // spec says up to 20
+        const len = @min(serial_number_buf.len, cert.serial_number.len);
+        @memcpy(serial_number_buf[0..len], cert.serial_number[0..len]);
+        const serial_number = std.fmt.bytesToHex(serial_number_buf, .lower)[0..len * 2];
+
+        const from = std.DateTime.fromEpoch(cert.validity.not_before).date;
+        const to = std.DateTime.fromEpoch(cert.validity.not_after).date;
+
+        // shame on you for issuing such a long lasting cert with a
+        // signature algorithm that was later broken.
+        // how did the cert bundler trust you in the first place?
+        log.debug(
+            "skipping cert {s} with insecure {}." ++
+            " issued by {s} from {d}-{d}-{d} to {d}-{d}-{d}.", .{
+            serial_number,
+            cert.signature_algo,
+            cert.issuer.organization.data,
+            from.year, from.month.numeric(), from.day,
+            to.year, to.month.numeric(), to.day,
+        });
         return;
     };
     if (now_sec > cert.validity.not_after) return;
@@ -235,19 +272,22 @@ const MapContext = struct {
 test rescan {
     if (builtin.os.tag == .wasi) return error.SkipZigTest;
 
-    var bundle: Bundle = .{};
-    defer bundle.deinit(std.testing.allocator);
+    const allocator = std.testing.allocator;
 
-    try bundle.rescan(std.testing.allocator);
+    var bundle: Bundle = .{};
+    defer bundle.deinit(allocator);
+
+    try bundle.rescan(allocator);
 }
 
 test verify {
     if (builtin.os.tag == .wasi) return error.SkipZigTest;
 
-    var bundle: Bundle = .{};
-    defer bundle.deinit(std.testing.allocator);
+    const allocator = std.testing.allocator;
 
-    try bundle.rescan(std.testing.allocator);
+    var bundle: Bundle = .{};
+    defer bundle.deinit(allocator);
+    try bundle.addCertsFromPem(allocator, @embedFile("../testdata/ca_bundle.pem"));
 
     const cert_bytes = @embedFile("../testdata/cert_lets_encrypt_r3.der");
     const cert = try Certificate.fromDer(cert_bytes);

@@ -11,8 +11,6 @@
 const std = @import("std");
 const DateTime = std.DateTime;
 
-const log = std.log.scoped(.der);
-
 pub const Parser = struct {
     bytes: []const u8,
     index: u32 = 0,
@@ -77,16 +75,13 @@ pub const Parser = struct {
         }
     }
 
+    pub fn nextOid(self: *Parser) !Element {
+        return try self.next(.universal, false, .object_identifier);
+    }
+
     pub fn nextEnum(self: *Parser, comptime Enum: type) !Enum {
-        const ele = try self.next(.universal, false, .object_identifier);
-        return Enum.oids.get(self.view(ele)) orelse {
-            const oid = Oid{ .bytes = self.view(ele) };
-            var buffer: [256]u8 = undefined;
-            var stream = std.io.fixedBufferStream(&buffer);
-            oid.toString(stream.writer()) catch {};
-            log.warn("unknown oid {s}", .{ stream.getWritten() });
-            return error.UnknownObjectId;
-        };
+        const ele = try self.nextOid();
+        return Enum.oids.get(self.view(ele)) orelse return error.UnknownObjectId;
     }
 
     pub fn nextSequence(self: *Parser) !Element {
@@ -428,10 +423,4 @@ test Oid {
         "1.2.840.113549.1.1.11",
     );
     try testOid(&[_]u8{ 0x2b, 0x65, 0x70 }, "1.3.101.112");
-
-    // const idk = hexToBytes("300d06092a864886f70d01010c0500");
-    // const oid = Oid{ .bytes = idk };
-    // var stream = std.io.getStdErr();
-    // try oid.toDecimal(stream.writer().any());
-    // try stream.writer().writeAll("\n");
 }
