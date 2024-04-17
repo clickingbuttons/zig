@@ -1,7 +1,10 @@
-//! Internet X.509 Public Key Infrastructure Certificate
-//! and Certificate Revocation List (CRL) Profile
+//! RFC 5280: Internet X.509 Public Key Infrastructure (PKI) Certificate
 //!
-//! RFC 5280
+//! Follows Mozilla's Certificate policy but additionally disallows SHA1.
+//! https://www.mozilla.org/en-US/about/governance/policies/security-group/certs/policy/#5-certificates
+//!
+//! Certificate Revocation Lists currently unimplemented since they need frequent updates
+//! and there is not a standard installation location.
 
 version: Version,
 serial_number: []const u8,
@@ -18,114 +21,84 @@ key_usage_ext: ?KeyUsageExt = null,
 /// Extension specifying maximum number of non-self-issued intermediate certificates that may
 /// follow this certificate in a valid certification path.
 max_depth: ?u8 = null,
-/// Means of identifying the public key corresponding to the private key used to
-/// sign a CRL.  The identification can be based on either the key
-/// identifier (the subject key identifier in the CRL signer's
-/// certificate) or the issuer name and serial number.  This extension is
-/// especially useful where an issuer has more than one signing key,
-/// either due to multiple concurrent key pairs or due to changeover.
+/// Algorithm family and parameters.
+/// Does NOT include signature's public key type.
+signature_algo: Signature.Algorithm,
+/// Signature from a higher level certificate.
 ///
-/// Conforming CRL issuers MUST use the key identifier method, and MUST
-/// include this extension in all CRLs issued.
-ca_pub_key: ?[]const u8 = null,
-signature: Signature,
+/// We could guess the type from the length but for ECDSA different curves have similar lengths.
+signature: der.BitString,
+/// The part of the certificate that is signed (start of serial number to end of extensions).
+tbs_bytes: []const u8,
 
 const Cert = @This();
 
-pub const VerifyError = error{
-    CertificateIssuerMismatch,
-    CertificateNotYetValid,
-    CertificateExpired,
-};
-
-/// This function verifies:
-///  * That the subject's issuer is indeed the provided issuer.
+/// Verify `subject` is trusted by `issuer`.
+///
+/// Verifies:
+///  * The subject's issuer is indeed the provided issuer.
 ///  * The time validity of the subject.
-///  * The signature.
+///  * The `issuer`'s signature is modern and valid.
 ///  * Usage matches key usage (if present).
 ///  * Usage matches extended key usage (if present).
-pub fn verify(subject_: Cert, issuer_: Cert, now_sec: i64) VerifyError!void {
-    // Check that the subject's issuer name matches the issuer's
-    // subject name.
-    if (!subject_.issuer.eql(issuer_.subject)) return error.CertificateIssuerMismatch;
-    if (now_sec < subject_.validity.not_before) return error.CertificateNotYetValid;
-    if (now_sec > subject_.validity.not_after) return error.CertificateExpired;
+pub fn verify(subject: Cert, issuer: Cert, now_sec: i64) !void {
+    if (!subject.issuer.eql(issuer.subject)) return error.CertificateIssuerMismatch;
+    if (now_sec < subject.validity.not_before) return error.CertificateNotYetValid;
+    if (now_sec > subject.validity.not_after) return error.CertificateExpired;
 
-    try subject_.signature.verify(issuer_.pub_key);
+    const signature = Signature{
+        .algo = subject.signature_algo,
+        .value = try Signature.Value.fromBitString(issuer.pub_key, subject.signature),
+    };
+    try signature.verify(subject.tbs_bytes, issuer.pub_key);
 }
 
-pub const VerifyHostNameError = error{
-    CertificateHostMismatch,
-    CertificateFieldHasInvalidLength,
-};
-
-pub fn verifyHostName(sub: Cert, host_name: []const u8) VerifyHostNameError!void {
-    // If the Subject Alternative Names extension is present, this is
-    // what to check. Otherwise, only the common_name name is checked.
-    const subject_alt_name = sub.subjectAltName();
-    if (subject_alt_name.len == 0) {
-        if (checkHostName(host_name, sub.common_nameName())) {
-            return;
-        } else {
-            return error.CertificateHostMismatch;
-        }
+pub fn verifyHostName(sub: Cert, host_name: []const u8) !void {
+    var has_aliases = false;
+    var iter = try sub.subjectAliasesIter();
+    while (try iter.next()) |alias| {
+        has_aliases = true;
+        if (checkHostName(host_name, alias)) return;
     }
-
-    const general_names = try der.Element.init(subject_alt_name, 0);
-    var name_i = general_names.slice.start;
-    while (name_i < general_names.slice.end) {
-        const general_name = try der.Element.init(subject_alt_name, name_i);
-        name_i = general_name.slice.end;
-        switch (@as(GeneralNameTag, @enumFromInt(@intFromEnum(general_name.identifier.tag)))) {
-            .dNSName => {
-                const dns_name = subject_alt_name[general_name.slice.start..general_name.slice.end];
-                if (checkHostName(host_name, dns_name)) return;
-            },
-            else => {},
-        }
+    if (!has_aliases) {
+        if (checkHostName(host_name, sub.subject.common_name)) return;
     }
 
     return error.CertificateHostMismatch;
 }
 
-// Check hostname according to RFC2818 specification:
-//
-// If more than one identity of a given type is present in
-// the certificate (e.g., more than one DNSName name, a match in any one
-// of the set is considered acceptable.) Names may contain the wildcard
-// character * which is considered to match any single domain name
-// component or component fragment. E.g., *.a.com matches foo.a.com but
-// not bar.foo.a.com. f*.com matches foo.com but not bar.com.
+/// Check `host_name` matches `dns_name` with single-domain wildcard support
+/// according to RFC 4952.
 fn checkHostName(host_name: []const u8, dns_name: []const u8) bool {
-    if (mem.eql(u8, dns_name, host_name)) {
-        return true; // exact match
-    }
-
     var it_host = std.mem.splitScalar(u8, host_name, '.');
     var it_dns = std.mem.splitScalar(u8, dns_name, '.');
 
-    const len_match = while (true) {
+    while (true) {
         const host = it_host.next();
         const dns = it_dns.next();
+        // done?
+        if (host == null and dns == null) return true;
+        // len mismatch?
+        if (host == null or dns == null) return false;
+        // wildcard?
+        if (std.mem.eql(u8, "*", dns.?)) continue;
+        // match?
+        if (!std.mem.eql(u8,  host.?, dns.?)) return false;
+    }
+}
 
-        if (host == null or dns == null) {
-            break host == null and dns == null;
-        }
-
-        // If not a wildcard and they dont
-        // match then there is no match.
-        if (mem.eql(u8, dns.?, "*") == false and mem.eql(u8, dns.?, host.?) == false) {
-            return false;
-        }
-    };
-
-    // If the components are not the same
-    // length then there is no match.
-    return len_match;
+test checkHostName {
+    try testing.expectEqual(true, checkHostName("foo.a.com", "*.a.com"));
+    try testing.expectEqual(false, checkHostName("bar.foo.a.com", "*.a.com"));
+    // rfc2818 says this should match, but rfc4952 disagrees.
+    // since rfc4952 came later and CAs tend to follow it, prefer its rules
+    try testing.expectEqual(false, checkHostName("foo.com", "f*.com"));
+    try testing.expectEqual(false, checkHostName("bar.com", "f*.com"));
 }
 
 pub const ParseError = der.Parser.Error || error{};
 
+/// Creates references to `bytes` which must outlive returned `Cert`.
 pub fn fromDer(bytes: []const u8) !Cert {
     var parser = der.Parser{ .bytes = bytes };
     var res = Cert{
@@ -135,11 +108,10 @@ pub fn fromDer(bytes: []const u8) !Cert {
         .validity = undefined,
         .subject = undefined,
         .pub_key = undefined,
+        .tbs_bytes = undefined,
+        .signature_algo = undefined,
         .signature = undefined,
     };
-
-    // this field appears early and MUST match the later `signature` field.
-    var sig_algo: Algorithm = undefined;
 
     {
         const cert = try parser.nextSequence();
@@ -148,6 +120,7 @@ pub fn fromDer(bytes: []const u8) !Cert {
         {
             const cert_tbs = try parser.nextSequence();
             defer parser.seek(cert_tbs.slice.end);
+            res.tbs_bytes = parser.bytes[cert.slice.start..cert_tbs.slice.end];
 
             {
                 const version_seq = try parser.next(.context_specific, true, @enumFromInt(0));
@@ -161,8 +134,8 @@ pub fn fromDer(bytes: []const u8) !Cert {
 
             const serial_number = try parser.nextPrimitive(.integer);
             res.serial_number = parser.view(serial_number);
-            sig_algo = try Algorithm.fromDer(&parser);
-            try sig_algo.validate();
+            // this field MUST match the later `signature` field
+            res.signature_algo = try Signature.Algorithm.fromDer(&parser);
 
             res.issuer = try Name.fromDer(&parser);
             res.validity = try Validity.fromDer(&parser);
@@ -188,12 +161,10 @@ pub fn fromDer(bytes: []const u8) !Cert {
             }
         }
 
-        const sig_algo2 = try Algorithm.fromDer(&parser);
-        if (!std.meta.eql(sig_algo, sig_algo2)) return error.SigAlgoMismatch;
+        const sig_algo2 = try Signature.Algorithm.fromDer(&parser);
+        if (!std.meta.eql(res.signature_algo, sig_algo2)) return error.SigAlgoMismatch;
 
-        const sig_bitstring = try parser.nextBitstring();
-        const sig_value = try Signature.Value.fromBitString(res.pub_key, sig_bitstring);
-        res.signature = .{ .algo = sig_algo, .value = sig_value };
+        res.signature = try parser.nextBitstring();
     }
 
     return res;
@@ -204,14 +175,12 @@ fn parseExtensions(res: *Cert, parser: *der.Parser) !void {
         unknown,
         key_usage,
         subject_alt_name,
-        authority_key_identifier,
         key_usage_ext,
         basic_constraints,
 
         pub const oids = std.ComptimeStringMap(@This(), .{
             .{ &comptimeOid("2.5.29.15"), .key_usage },
             .{ &comptimeOid("2.5.29.17"), .subject_alt_name },
-            .{ &comptimeOid("2.5.29.35"), .authority_key_identifier },
             .{ &comptimeOid("2.5.29.37"), .key_usage_ext },
             .{ &comptimeOid("2.5.29.19"), .basic_constraints },
         });
@@ -235,22 +204,10 @@ fn parseExtensions(res: *Cert, parser: *der.Parser) !void {
         const doc_bytes = parser.view(doc);
         switch (tag) {
             .unknown => {
-                if (critical) {
-                    rsa.debugPrint("doc",  doc_bytes);
-                    return error.UnimplementedCriticalExtension;
-                }
+                if (critical) return error.UnimplementedCriticalExtension;
             },
             .key_usage => {
-                var parser2 = der.Parser{ .bytes = doc_bytes };
-                res.key_usage = try KeyUsage.fromDer(&parser2);
-            },
-            .authority_key_identifier => {
-                var parser2 = der.Parser{ .bytes = doc_bytes };
-                const seq3 = try parser2.nextSequence();
-                defer parser2.seek(seq3.slice.end);
-
-                const pub_key_ele = try parser2.next(.context_specific, false, @enumFromInt(0));
-                res.ca_pub_key = parser2.view(pub_key_ele);
+                res.key_usage = try KeyUsage.fromDer(doc_bytes);
             },
             .key_usage_ext => {
                 var parser2 = der.Parser{ .bytes = doc_bytes };
@@ -260,14 +217,14 @@ fn parseExtensions(res: *Cert, parser: *der.Parser) !void {
                 res.subject_aliases_raw_der = doc_bytes;
             },
             .basic_constraints => {
-                var parser2 = der.Parser{ .bytes = doc_bytes };
-                const seq3 = try parser2.nextSequence();
-                if (seq3.slice.len() > 0) {
-                    const is_ca = try parser2.nextBool();
-                    const max_depth = try parser2.nextInt(i8);
-                    if (max_depth < 0) return error.InvalidBasicConstraints;
-                    if (is_ca) res.max_depth = @bitCast(max_depth);
-                }
+                // var parser2 = der.Parser{ .bytes = doc_bytes };
+                // const seq3 = try parser2.nextSequence();
+                // if (seq3.slice.len() > 0) {
+                //     const is_ca = try parser2.nextBool();
+                //     const max_depth = try parser2.nextInt(i8);
+                //     if (max_depth < 0) return error.InvalidBasicConstraints;
+                //     if (is_ca) res.max_depth = @bitCast(max_depth);
+                // }
             },
         }
     }
@@ -277,19 +234,12 @@ pub const SubjectAliasesIter = struct {
     parser: der.Parser,
     seq: der.Element,
 
-    pub const Error = der.Parser.Error || error{InvalidSubjectAltString};
-
-    /// Currently only supports rfc822Name and dnsName of section 4.2.1.6
-    pub fn next(it: *@This()) Error!?[]const u8 {
+    /// Next dnsName (RFC 5280 S4.2.1.6)
+    pub fn next(it: *@This()) !?[]const u8 {
         while (it.parser.index < it.seq.slice.end) {
             const ele = try it.parser.next(.context_specific, null, null);
             switch (@intFromEnum(ele.identifier.tag)) {
-                1, // rfc822Name
-                2, // dNSName
-                => {
-                    if (ele.identifier.tag != .string_ia5) return error.InvalidSubjectAltString;
-                    return it.parser.view(ele);
-                },
+                2 => return it.parser.view(ele),
                 else => {
                     // We don't support the rest of the spec here since we currently only care
                     // about verifying HTTPS.
@@ -307,7 +257,7 @@ pub const SubjectAliasesIter = struct {
 
 fn subjectAliasesIter(c: Cert) !SubjectAliasesIter {
     if (c.subject_aliases_raw_der) |bytes| {
-        const parser = der.Parser{ .bytes = bytes };
+        var parser = der.Parser{ .bytes = bytes };
         const seq = try parser.nextSequence();
         return SubjectAliasesIter{ .parser = parser, .seq = seq };
     } else {
@@ -419,20 +369,33 @@ pub const Validity = struct {
 };
 
 pub const Name = struct {
-    country: []const u8 = "",
-    organization: []const u8 = "",
-    organizational_unit: []const u8 = "",
-    distinguished_qualifier: []const u8 = "",
-    state_or_province: []const u8 = "",
-    common_name: []const u8 = "",
-    serial_number: []const u8 = "",
-    locality: []const u8 = "",
-    title: []const u8 = "",
-    surname: []const u8 = "",
-    given_name: []const u8 = "",
-    initials: []const u8 = "",
-    pseudonym: []const u8 = "",
-    generation_qualifier: []const u8 = "",
+    // must implement
+    country: DirectoryString = empty,
+    organization: DirectoryString = empty,
+    organizational_unit: DirectoryString = empty,
+    distinguished_name: DirectoryString = empty,
+    state_or_province: DirectoryString = empty,
+    common_name: DirectoryString = empty,
+    serial_number: DirectoryString = empty,
+    domain_component: []const u8 = "",
+    // may implement
+    locality: DirectoryString = empty,
+    title: DirectoryString = empty,
+    surname: DirectoryString = empty,
+    given_name: DirectoryString = empty,
+    initials: DirectoryString = empty,
+    pseudonym: DirectoryString = empty,
+    generation_qualifier: DirectoryString = empty,
+    // in root certs
+    organization_id: DirectoryString = empty,
+    /// deprecated in favor of altName extension
+    email_address: []const u8 = "",
+    /// for unknown fields
+    kvs_len: u8 = 0,
+    kvs: KVs = [_][]const u8{""} ** 7,
+
+    const empty = DirectoryString{ .tag = .utf8, .data = "" };
+    pub const KVs = [7][]const u8;
 
     pub fn fromDer(parser: *der.Parser) !Name {
         var res = Name{};
@@ -442,25 +405,100 @@ pub const Name = struct {
             const kv = try parser.nextSequenceOf();
             defer parser.index = kv.slice.end;
 
-            _ = try parser.nextSequence();
-            const key = try parser.nextEnum(Attribute);
-            switch (key) {
-                .countryName => res.country = try nextDirString(parser),
-                .organizationName => res.organization = try nextDirString(parser),
-                .organizationalUnitName => res.organizational_unit = try nextDirString(parser),
-                .common_nameName => res.common_name = try nextDirString(parser),
-                else => {
-                    std.debug.print("bad key {}\n", .{key});
+            const seq2 = try parser.nextSequence();
+            const key = parser.nextEnum(Attribute) catch |err| switch (err) {
+                error.UnknownObjectId => {
+                    if (res.kvs_len < res.kvs.len) {
+                        res.kvs_len += 1;
+                        res.kvs[res.kvs_len] = parser.view(seq2);
+                        continue;
+                    } else {
+                        return error.NameAttributeOverflow;
+                    }
                 },
+                else => return err,
+            };
+            switch (key) {
+                inline .domain_component, .email_address => |t| {
+                    const ele = try parser.next(.universal, false, null);
+                    if (ele.identifier.tag != .string_ia5) return error.InvalidDomainComponent;
+                    @field(res, @tagName(t)) = parser.view(ele);
+                },
+                inline else => |t| {
+                    @field(res, @tagName(t)) = try DirectoryString.fromDer(parser);
+                }
             }
         }
 
         return res;
     }
 
+    // match field names for easy `inline else`
+    const Attribute = enum {
+        country,
+        organization,
+        organizational_unit,
+        distinguished_name,
+        state_or_province,
+        common_name,
+        serial_number,
+        domain_component,
+        locality,
+        title,
+        surname,
+        given_name,
+        initials,
+        pseudonym,
+        generation_qualifier,
+        organization_id,
+        email_address,
+
+        pub const oids = std.ComptimeStringMap(Attribute, .{
+            .{ &comptimeOid("0.9.2342.19200300.100.1.25"), .domain_component },
+            .{ &comptimeOid("1.2.840.113549.1.9.1"), .email_address },
+            .{ &comptimeOid("2.5.4.3"), .common_name },
+            .{ &comptimeOid("2.5.4.4"), .surname },
+            .{ &comptimeOid("2.5.4.5"), .serial_number },
+            .{ &comptimeOid("2.5.4.6"), .country},
+            .{ &comptimeOid("2.5.4.7"), .locality },
+            .{ &comptimeOid("2.5.4.8"), .state_or_province },
+            .{ &comptimeOid("2.5.4.10"), .organization },
+            .{ &comptimeOid("2.5.4.11"), .organizational_unit },
+            .{ &comptimeOid("2.5.4.12"), .title },
+            .{ &comptimeOid("2.5.4.42"), .given_name },
+            .{ &comptimeOid("2.5.4.43"), .initials },
+            .{ &comptimeOid("2.5.4.44"), .generation_qualifier },
+            .{ &comptimeOid("2.5.4.49"), .distinguished_name },
+            .{ &comptimeOid("2.5.4.65"), .pseudonym },
+            .{ &comptimeOid("2.5.4.97"), .organization_id },
+        });
+
+        comptime {
+            std.debug.assert(std.meta.fields(@This()).len == oids.kvs.len);
+        }
+    };
+
+    /// TODO: use unicode mapping, lowering, and normalization in RFC 5280 S7.1
+    /// Will require unicode mapping tables from RFC 4818 and RFC 3454.
+    ///
+    /// This version is stricter but less internationalized.
     pub fn eql(self: Name, other: Name) bool {
         inline for (@typeInfo(Name).Struct.fields) |field| {
-            if (!mem.eql(u8, @field(self, field.name), @field(other, field.name))) return false;
+            const v1 = @field(self, field.name);
+            const v2 = @field(other, field.name);
+            if (field.type == DirectoryString) {
+                if (!v1.cmp(v2)) return false;
+            } else if (field.type == []const u8) {
+                if (!mem.eql(u8, v1, v2)) return false;
+            } else if (field.type == u8) {
+                if (v1 != v2) return false;
+            } else if (field.type == [7][]const u8) {
+                for (v1, v2) |s1, s2| {
+                    if (!mem.eql(u8, s1, s2)) return false;
+                }
+            } else {
+                @compileError("add else if for " ++ @typeName(field.type));
+            }
         }
         return true;
     }
@@ -499,11 +537,11 @@ const AlgorithmTag = enum {
     ed25519,
 
     pub const oids = std.ComptimeStringMap(AlgorithmTag, .{
-        .{ &comptimeOid("1.2.840.113549.1.1.14"), .rsa_pkcs_sha224 },
+        .{ &comptimeOid("1.2.840.113549.1.1.10"), .rsa_pss },
         .{ &comptimeOid("1.2.840.113549.1.1.11"), .rsa_pkcs_sha256 },
         .{ &comptimeOid("1.2.840.113549.1.1.12"), .rsa_pkcs_sha384 },
         .{ &comptimeOid("1.2.840.113549.1.1.13"), .rsa_pkcs_sha512 },
-        .{ &comptimeOid("1.2.840.113549.1.1.10"), .rsa_pss },
+        .{ &comptimeOid("1.2.840.113549.1.1.14"), .rsa_pkcs_sha224 },
         .{ &comptimeOid("1.2.840.10045.4.3.1"), .ecdsa_sha224 },
         .{ &comptimeOid("1.2.840.10045.4.3.2"), .ecdsa_sha256 },
         .{ &comptimeOid("1.2.840.10045.4.3.3"), .ecdsa_sha384 },
@@ -512,149 +550,25 @@ const AlgorithmTag = enum {
     });
 };
 
-pub const Algorithm = union(enum) {
-    rsa_pkcs: HashTag,
-    rsa_pss: RsaPss,
-    ecdsa: Ecdsa,
-    ed25519: void,
-
-    fn fromDer(parser: *der.Parser) !Algorithm {
-        const seq = try parser.nextSequence();
-        defer parser.seek(seq.slice.end);
-
-        const algo = try parser.nextEnum(AlgorithmTag);
-        switch (algo) {
-            inline
-            .rsa_pkcs_sha224,
-            .rsa_pkcs_sha256,
-            .rsa_pkcs_sha384,
-            .rsa_pkcs_sha512,
-            => |t| {
-                _ = try parser.nextPrimitive(.null);
-                const hash = std.meta.stringToEnum(HashTag, @tagName(t)["rsa_pkcs_".len..]).?;
-                return .{ .rsa_pkcs = hash };
-            },
-            .rsa_pss => return .{ .rsa_pss = try RsaPss.fromDer(parser) },
-            inline
-            .ecdsa_sha224,
-            .ecdsa_sha256,
-            .ecdsa_sha384,
-            .ecdsa_sha512,
-            => |t| {
-                const curve = if (parser.index != seq.slice.end) try parser.nextEnum(NamedCurve) else null;
-                return .{
-                    .ecdsa = Ecdsa{
-                        .hash = std.meta.stringToEnum(HashTag, @tagName(t)["ecdsa_".len..]).?,
-                        .curve = curve,
-                    }
-                };
-            },
-            .ed25519 => return .{ .ed25519 = {} },
-        }
-    }
-
-    /// Make sure this algorithm is secure.
-    /// Follows version of Mozilla's Certificate policy which additionally disallows SHA1.
-    /// https://www.mozilla.org/en-US/about/governance/policies/security-group/certs/policy/#5-certificates
-    fn validate(self: Algorithm) !void {
-        switch (self) {
-            .rsa_pkcs => |h| try h.validate(),
-            .rsa_pss => |opts| try opts.hash.validate(),
-            .ecdsa => |opts| try opts.hash.validate(),
-            .ed25519 => {}, // always uses sha512
-        }
-    }
-
-    // RFC 4055 S3.1
-    const RsaPss = struct {
-        hash: HashTag,
-        mask_gen: MaskGen,
-        salt_len: u8,
-
-        pub fn fromDer(parser: *der.Parser) !RsaPss {
-            const body = try parser.nextSequence();
-            defer parser.seek(body.slice.end);
-
-            const hash = brk: {
-                const seq = try parser.nextSequence();
-                defer parser.seek(seq.slice.end);
-                const hash = try parser.nextEnum(HashTag);
-                _ = try parser.nextPrimitive(.null);
-                break :brk hash;
-            };
-
-            const mask_gen = try MaskGen.fromDer(parser);
-            const salt_len = try parser.nextInt(i8);
-            if (salt_len < 0) return error.InvalidSaltLength;
-
-            return .{ .hash = hash, .mask_gen = mask_gen, .salt_len = @bitCast(salt_len) };
-        }
-
-        const MaskGen = struct {
-            tag: Tag,
-            hash: HashTag,
-
-            pub fn fromDer(parser: *der.Parser) !MaskGen {
-                const seq = try parser.nextSequence();
-                defer parser.seek(seq.slice.end);
-
-                const tag = try parser.nextEnum(Tag);
-                const hash = try parser.nextEnum(HashTag);
-                return .{ .tag = tag, .hash = hash };
-            }
-
-            const Tag = enum {
-                mgf1,
-
-                pub const oids = std.ComptimeStringMap(@This(), .{
-                    .{ &comptimeOid("1.2.840.113549.1.1.8"), .mgf1 },
-                });
-            };
-        };
-    };
-
-    const Ecdsa = struct {
-        hash: HashTag,
-        curve: ?NamedCurve,
-    };
-};
-
 const HashTag = enum {
-    sha1,
     sha224,
     sha256,
     sha384,
     sha512,
-    sha512_224,
-    sha512_256,
 
     pub const oids = std.ComptimeStringMap(@This(), .{
-        .{ &comptimeOid("1.3.14.3.2.26"), .sha1 },
         .{ &comptimeOid("2.16.840.1.101.3.4.2.1"), .sha256 },
         .{ &comptimeOid("2.16.840.1.101.3.4.2.2"), .sha384 },
         .{ &comptimeOid("2.16.840.1.101.3.4.2.3"), .sha512 },
         .{ &comptimeOid("2.16.840.1.101.3.4.2.4"), .sha224 },
-        .{ &comptimeOid("2.16.840.1.101.3.4.2.5"), .sha512_224 },
-        .{ &comptimeOid("2.16.840.1.101.3.4.2.6"), .sha512_256 },
     });
-
-    /// Returns error if not secure.
-    pub fn validate(tag: HashTag) !void {
-        switch (tag) {
-            .sha1 => return error.InsecureHash,
-            else => {},
-        }
-    }
 
     pub fn Hash(comptime self: HashTag) type {
         return switch (self) {
-            .sha1 => return crypto.hash.Sha1,
             .sha224 => return crypto.hash.sha2.Sha224,
             .sha256 => return crypto.hash.sha2.Sha256,
             .sha384 => return crypto.hash.sha2.Sha384,
             .sha512 => return crypto.hash.sha2.Sha512,
-            .sha512_224 => return crypto.hash.sha2.Sha512_224,
-            .sha512_256 => return crypto.hash.sha2.Sha512_256,
         };
     }
 };
@@ -662,6 +576,101 @@ const HashTag = enum {
 pub const Signature = struct {
     algo: Algorithm,
     value: Value,
+
+    pub const Algorithm = union(enum) {
+        rsa_pkcs: HashTag,
+        rsa_pss: RsaPss,
+        ecdsa: Ecdsa,
+        ed25519: void,
+
+        fn fromDer(parser: *der.Parser) !Algorithm {
+            const seq = try parser.nextSequence();
+            defer parser.seek(seq.slice.end);
+
+            const algo = try parser.nextEnum(AlgorithmTag);
+            switch (algo) {
+                inline
+                .rsa_pkcs_sha224,
+                .rsa_pkcs_sha256,
+                .rsa_pkcs_sha384,
+                .rsa_pkcs_sha512,
+                => |t| {
+                    _ = try parser.nextPrimitive(.null);
+                    const hash = std.meta.stringToEnum(HashTag, @tagName(t)["rsa_pkcs_".len..]).?;
+                    return .{ .rsa_pkcs = hash };
+                },
+                .rsa_pss => return .{ .rsa_pss = try RsaPss.fromDer(parser) },
+                inline
+                .ecdsa_sha224,
+                .ecdsa_sha256,
+                .ecdsa_sha384,
+                .ecdsa_sha512,
+                => |t| {
+                    const curve = if (parser.index != seq.slice.end) try parser.nextEnum(NamedCurve) else null;
+                    return .{
+                        .ecdsa = Ecdsa{
+                            .hash = std.meta.stringToEnum(HashTag, @tagName(t)["ecdsa_".len..]).?,
+                            .curve = curve,
+                        }
+                    };
+                },
+                .ed25519 => return .{ .ed25519 = {} },
+            }
+        }
+
+        // RFC 4055 S3.1
+        const RsaPss = struct {
+            hash: HashTag,
+            mask_gen: MaskGen,
+            salt_len: u8,
+
+            pub fn fromDer(parser: *der.Parser) !RsaPss {
+                const body = try parser.nextSequence();
+                defer parser.seek(body.slice.end);
+
+                const hash = brk: {
+                    const seq = try parser.nextSequence();
+                    defer parser.seek(seq.slice.end);
+                    const hash = try parser.nextEnum(HashTag);
+                    _ = try parser.nextPrimitive(.null);
+                    break :brk hash;
+                };
+
+                const mask_gen = try MaskGen.fromDer(parser);
+                const salt_len = try parser.nextInt(i8);
+                if (salt_len < 0) return error.InvalidSaltLength;
+
+                return .{ .hash = hash, .mask_gen = mask_gen, .salt_len = @bitCast(salt_len) };
+            }
+
+            const MaskGen = struct {
+                tag: Tag,
+                hash: HashTag,
+
+                pub fn fromDer(parser: *der.Parser) !MaskGen {
+                    const seq = try parser.nextSequence();
+                    defer parser.seek(seq.slice.end);
+
+                    const tag = try parser.nextEnum(Tag);
+                    const hash = try parser.nextEnum(HashTag);
+                    return .{ .tag = tag, .hash = hash };
+                }
+
+                const Tag = enum {
+                    mgf1,
+
+                    pub const oids = std.ComptimeStringMap(@This(), .{
+                        .{ &comptimeOid("1.2.840.113549.1.1.8"), .mgf1 },
+                    });
+                };
+            };
+        };
+
+        const Ecdsa = struct {
+            hash: HashTag,
+            curve: ?NamedCurve,
+        };
+    };
 
     const Value = union(PubKeyTag) {
         rsa2048: Rsa2048.Signature,
@@ -674,12 +683,11 @@ pub const Signature = struct {
 
         pub fn fromBitString(tag: PubKeyTag, bitstring: der.BitString) !Value {
             if (bitstring.right_padding != 0) return error.InvalidSignature;
-            var parser = der.Parser{ .bytes = bitstring.bytes };
 
             switch (tag) {
                 inline else => |t| {
                     const T = std.meta.FieldType(@This(), t);
-                    const value = try T.fromDer(&parser);
+                    const value = try T.fromDer(bitstring.bytes);
                     return @unionInit(Value, @tagName(t), value);
                 },
             }
@@ -691,96 +699,81 @@ pub const Signature = struct {
         if (std.meta.activeTag(pub_key) != std.meta.activeTag(self.value)) return error.PublicKeyMismatch;
 
         switch (self.value) {
-            .rsa2048, .rsa3072, .rsa4096 => |sig| {
+            inline .rsa2048, .rsa3072, .rsa4096 => |sig, t| {
+                const pk = @field(pub_key, @tagName(t));
                 switch (self.algo) {
                     .rsa_pkcs => |hash| {
-                        const Hash = switch (hash) {
-                            inline else => |h| h.Hash(),
-                        };
-                        try sig.value.pss(Hash).verify(message, pub_key);
+                        switch (hash) {
+                            inline else => |h| {
+                                try sig.pkcsv1_5(h.Hash()).verify(message, pk);
+                            }
+                        }
                     },
                     .rsa_pss => |opts| {
-                        const Hash = switch (opts.hash) {
-                            inline else => |h| h.Hash(),
-                        };
-                        if (opts.mask_gen != .mgf1) return error.UnsupportedMaskGenerationFunction;
-                        try sig.value.pss(Hash).verify(message, pub_key, opts.salt_len);
+                        if (opts.mask_gen.tag  != .mgf1 or opts.mask_gen.hash != .sha256) {
+                            return error.UnsupportedMaskGenerationFunction;
+                        }
+                        switch (opts.hash) {
+                            inline else => |h| {
+                                try sig.pss(h.Hash()).verify(message, pk, opts.salt_len);
+                            }
+                        }
                     },
                     else => return error.AlgorithmMismatch,
                 }
             },
-            .ecdsa_p256, .ecdsa_p384, .ecdsa_secp256 => |sig| {
+            inline .ecdsa_p256, .ecdsa_p384, .ecdsa_secp256 => |sig, t| {
+                const pk = @field(pub_key, @tagName(t));
                 switch (self.algo) {
                     .ecdsa => |opts| {
-                        try sig.verify(opts.hash, message, pub_key);
+                        switch (opts.hash) {
+                            inline else => |h| {
+                                try sig.verify(h.Hash(), message, pk);
+                            }
+                        }
                     },
                     else => return error.AlgorithmMismatch,
                 }
             },
-            .ed25519_sha512 => |sig| {
-                try sig.verify(message, pub_key);
+            .ed25519 => |sig| {
+                switch (self.algo) {
+                    .ed25519 => try sig.verify(message, pub_key.ed25519),
+                    else => return error.AlgorithmMismatch,
+                }
             },
         }
     }
 
     const sha2 = crypto.hash.sha2;
-    const Ecdsa = crypto.sign.ecdsa.Ecdsa;
-};
-
-pub const Attribute = enum {
-    common_nameName,
-    serialNumber,
-    countryName,
-    localityName,
-    stateOrProvinceName,
-    streetAddress,
-    organizationName,
-    organizationalUnitName,
-    postalCode,
-    organizationIdentifier,
-    pkcs9_emailAddress,
-    domainComponent,
-
-    pub const oids = std.ComptimeStringMap(Attribute, .{
-        .{ &comptimeOid("2.5.4.3"), .common_nameName },
-        .{ &comptimeOid("2.5.4.5"), .serialNumber },
-        .{ &comptimeOid("2.5.4.6"), .countryName },
-        .{ &comptimeOid("2.5.4.7"), .localityName },
-        .{ &comptimeOid("2.5.4.8"), .stateOrProvinceName },
-        .{ &comptimeOid("2.5.4.9"), .streetAddress },
-        .{ &comptimeOid("2.5.4.10"), .organizationName },
-        .{ &comptimeOid("2.5.4.11"), .organizationalUnitName },
-        .{ &comptimeOid("2.5.4.17"), .postalCode },
-        .{ &comptimeOid("2.5.4.97"), .organizationIdentifier },
-        .{ &comptimeOid("1.2.840.113549.1.9.1"), .pkcs9_emailAddress },
-        .{ &comptimeOid("0.9.2342.19200300.100.1.25"), .domainComponent },
-    });
 };
 
 pub const KeyUsage = packed struct {
-    digital_signature: bool = false,
-    content_commitment: bool = false,
-    key_encipherment: bool = false,
-    data_encipherment: bool = false,
-    key_agreement: bool = false,
-    key_cert_sign: bool = false,
-    crl_sign: bool = false,
+    // fields are in reverse bit order because of how zig packs structs
     encipher_only: bool = false,
+    crl_sign: bool = false,
+    key_cert_sign: bool = false,
+    key_agreement: bool = false,
+    data_encipherment: bool = false,
+    key_encipherment: bool = false,
+    content_commitment: bool = false,
+    digital_signature: bool = true,
+
     decipher_only: bool = false,
 
-    pub fn fromDer(parser: *der.Parser) !KeyUsage {
-        const bitstring = try parser.nextBitstring();
+    pub fn fromDer(bytes: []const u8) !KeyUsage {
+        var parser = der.Parser{ .bytes = bytes };
+        const key_usage = try parser.nextBitstring();
+        if (key_usage.bytes.len > @sizeOf(KeyUsage)) return error.InvalidKeyUsage;
 
         var res = KeyUsage{};
-        var bytes = mem.asBytes(&res);
-        // copy what there is into our struct
-        const to_copy = @min(bytes.len, bitstring.bytes.len);
-        @memcpy(bytes[0..to_copy], bitstring.bytes[0..to_copy]);
+        var res_bytes = mem.asBytes(&res);
+        @memcpy(res_bytes[0..key_usage.bytes.len], key_usage.bytes);
+
         return res;
     }
 };
 
-pub const KeyUsageExt = struct {
+pub const KeyUsageExt = packed struct {
     server_auth: bool = false,
     client_auth: bool = false,
     code_signing: bool = false,
@@ -843,15 +836,38 @@ pub const GeneralNameTag = enum(u5) {
     _,
 };
 
-fn nextDirString(parser: *der.Parser) ![]const u8 {
-    const ele = try parser.next(.universal, false, null);
-    switch (ele.identifier.tag) {
-        .string_teletex, .string_printable, .string_universal, .string_utf8, .string_bmp => {
-            return parser.view(ele);
-        },
-        else => return error.InvalidDirectoryString,
+pub const DirectoryString = struct {
+    tag: Tag,
+    data: []const u8,
+
+    const Tag = enum {
+        teletex,
+        printable,
+        universal,
+        utf8,
+        bmp,
+    };
+    const Self = @This();
+
+    pub fn fromDer(parser: *der.Parser) !Self {
+        const ele = try parser.next(.universal, false, null);
+        const tag: Tag = switch (ele.identifier.tag) {
+            .string_teletex => .teletex,
+            .string_printable => .printable,
+            .string_universal => .universal,
+            .string_utf8 => .utf8,
+            .string_bmp => .bmp,
+            else => return error.InvalidDirectoryString,
+        };
+
+        return .{ .tag = tag, .data = parser.view(ele) };
     }
-}
+
+    /// TODO: use RFC 5280 S7.2 for better internationalization
+    pub fn cmp(self: Self, other: Self) bool {
+        return std.mem.eql(u8, self.data, other.data);
+    }
+};
 
 fn comptimeOidFromString(comptime bytes: []const u8) Oid {
     @setEvalBranchQuota(10_000);
@@ -895,30 +911,84 @@ inline fn hexToBytes(comptime hex: []const u8) []u8 {
     return std.fmt.hexToBytes(&res, hex) catch unreachable;
 }
 
-test fromDer {
-    // exact same cert as https://tls13.xargs.org/certificate.html
-    // can also verify with:
-    // $ openssl x509 -inform der -in ./testdata/cert.der -noout -text
-    const cert_bytes = @embedFile("testdata/cert.der");
+fn expectEqualName(n1: Name, n2: Name) !void {
+    inline for (std.meta.fields(Name)) |f| {
+        const v1 = @field(n1, f.name);
+        const v2 = @field(n2, f.name);
+        if (f.type == DirectoryString) {
+            try testing.expectEqual(v1.tag, v2.tag);
+            try testing.expectEqualStrings(v1.data, v2.data);
+        } else if (f.type == []const u8) {
+            try testing.expectEqualStrings(v1, v2);
+        } else if (f.type == u8) {
+            try testing.expectEqual(v1, v2);
+        } else if (f.type == Name.KVs) {
+            for (v1, v2) |s1, s2| {
+                try testing.expectEqualStrings(s1, s2);
+            }
+        } else {
+            @compileError("implement type " ++ @typeName(f.type));
+        }
+    }
+}
+
+test "certificate fromDer rsa2048" {
+    // fake cert from https://tls13.xargs.org/certificate.html
+    // can also view with:
+    // $ openssl x509 -inform der -noout -text -in ./testdata/cert_rsa2048.der
+    const cert_bytes = @embedFile("testdata/cert_rsa2048.der");
     const cert = try Cert.fromDer(cert_bytes);
 
     try testing.expectEqual(Version.v3, cert.version);
     try testing.expectEqualSlices(u8, hexToBytes("155a92adc2048f90"), cert.serial_number);
-    try testing.expectEqualStrings("US", cert.issuer.country);
-    try testing.expectEqualStrings("Example CA", cert.issuer.organization);
+    try expectEqualName(Name{
+        .country = DirectoryString{ .tag = .printable, .data = "US" },
+        .organization = DirectoryString{ .tag = .printable, .data = "Example CA" },
+    }, cert.issuer);
     try testing.expectEqual(1538703497, cert.validity.not_before);
     try testing.expectEqual(1570239497, cert.validity.not_after);
-    try testing.expectEqualStrings("US", cert.subject.country);
-    try testing.expectEqualStrings("example.ulfheim.net", cert.subject.common_name);
+    try expectEqualName(Name{
+        .country = DirectoryString{ .tag = .printable, .data =  "US" },
+        .common_name = DirectoryString{ .tag = .printable, .data = "example.ulfheim.net" },
+    }, cert.subject);
     try testing.expectEqual(PubKey.rsa2048, std.meta.activeTag(cert.pub_key));
     try testing.expectEqual(@as(usize, 65537), try cert.pub_key.rsa2048.public_exponent.toPrimitive(usize));
-    try testing.expectEqual(Algorithm{ .rsa_pkcs = .sha256 }, cert.signature.algo);
-    try testing.expectEqualSlices(u8, &[_]u8{ 0x59, 0x16 }, cert.signature.value.rsa2048.bytes[0..2]);
+    // extensions
+    try testing.expectEqual(KeyUsage{ .digital_signature = true, .key_encipherment = true }, cert.key_usage);
+    try testing.expectEqual(KeyUsageExt{ .client_auth = true, .server_auth = true }, cert.key_usage_ext);
+    // sig
+    try testing.expectEqual(Signature.Algorithm{ .rsa_pkcs = .sha256 }, cert.signature_algo);
+    try testing.expectEqualSlices(u8, cert_bytes[549..], cert.signature.bytes);
 }
 
-test "fromDer ecda" {
-    const cert_bytes = @embedFile("testdata/cert_ecdsa.der");
+test "certificate fromDer ecc256" {
+    // real cert from https://ecc256.badssl.com circa 2024-04
+    // $ true | openssl s_client -connect ecc256.badssl.com:443 2>/dev/null | openssl x509 -inform pem -outform der > ./testdata/cert_ecc256.der
+    const cert_bytes = @embedFile("testdata/cert_ecc256.der");
     const cert = try Cert.fromDer(cert_bytes);
 
     try testing.expectEqual(Version.v3, cert.version);
+    try testing.expectEqualSlices(u8, hexToBytes("03e727237862e5ac970afbd1f2cd25584f79"), cert.serial_number);
+    try expectEqualName(Name{
+        .country = .{ .tag = .printable, .data = "US" },
+        .organization = .{ .tag = .printable, .data = "Let's Encrypt" },
+        .common_name = .{ .tag = .printable, .data = "R3" },
+    }, cert.issuer);
+    try testing.expectEqual(1708547232, cert.validity.not_before);
+    try testing.expectEqual(1716323231, cert.validity.not_after);
+    try expectEqualName(Name{
+        .common_name = .{ .tag = .utf8, .data =  "*.badssl.com" },
+    }, cert.subject);
+    try testing.expectEqual(PubKey.ecdsa_p256, std.meta.activeTag(cert.pub_key));
+    // extensions
+    try testing.expectEqual(KeyUsage{ .digital_signature = true }, cert.key_usage);
+    try testing.expectEqual(KeyUsageExt{ .client_auth = true, .server_auth = true }, cert.key_usage_ext);
+    try testing.expectEqual(null, cert.max_depth);
+    var iter = try cert.subjectAliasesIter();
+    try testing.expectEqualStrings("*.badssl.com", (try iter.next()).?);
+    try testing.expectEqualStrings("badssl.com", (try iter.next()).?);
+    try testing.expectEqual(null, try iter.next());
+    // sig
+    try testing.expectEqual(Signature.Algorithm{ .rsa_pkcs = .sha256 }, cert.signature_algo);
+    try testing.expectEqualSlices(u8, cert_bytes[808..], cert.signature.bytes);
 }

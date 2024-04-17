@@ -214,19 +214,24 @@ pub const Ed25519 = struct {
             };
         }
 
-        pub fn fromDer(parser: *der.Parser) !Signature {
+        pub fn fromDer(bytes: []const u8) !Signature {
+            var parser = der.Parser{ .bytes = bytes };
             const seq = try parser.nextSequence();
             defer parser.seek(seq.slice.end);
 
-            const r = try parser.nextPrimitive(.integer);
-            if (r.slice.len() != Curve.encoded_length) return error.InvalidScalarR;
-            const s = try parser.nextPrimitive(.integer);
-            if (s.slice.len() != @sizeOf(CompressedScalar)) return error.InvalidScalarS;
+            const r = try parser.nextInteger();
+            if (r.slice.len() > Curve.encoded_length) return error.InvalidScalar;
+            const s = try parser.nextInteger();
+            if (s.slice.len() > @sizeOf(CompressedScalar)) return error.InvalidScalar;
 
-            return Signature{
-                .r = parser.view(r)[0..Curve.encoded_length].*,
-                .s = parser.view(s)[0..@sizeOf(CompressedScalar)].*,
-            };
+            if (parser.index != seq.slice.end) return error.InvalidSequence;
+            if (parser.index != parser.bytes.len) return error.InvalidSequence;
+
+            var res = std.mem.zeroInit(Signature, .{});
+            @memcpy(res.r[res.r.len - parser.view(r).len..], parser.view(r));
+            @memcpy(res.s[res.r.len - parser.view(s).len..], parser.view(s));
+
+            return res;
         }
 
         /// Create a Verifier for incremental verification of a signature.

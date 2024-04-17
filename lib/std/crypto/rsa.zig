@@ -266,16 +266,16 @@ pub fn Rsa(comptime modulus_bits: usize) type {
                 return .{ .bytes = bytes };
             }
 
-            pub fn fromDer(parser: *der.Parser) !Signature {
-                if (parser.bytes.len != modulus_len) return error.InvalidLength;
-                return .{ .bytes = parser.bytes[0..modulus_len].* };
+            pub fn fromDer(bytes: []const u8) !Signature {
+                if (bytes.len != modulus_len) return error.InvalidLength;
+                return .{ .bytes = bytes[0..modulus_len].* };
             }
 
-            pub fn pss(self: @This(), comptime Hash: type) PSS(Hash) {
+            pub fn pss(self: @This(), comptime Hash: type) PSS(Hash).Signature {
                 return PSS(Hash).Signature{ .bytes = self.bytes };
             }
 
-            pub fn pkcsv1_5(self: @This(), comptime Hash: type) PSS(Hash) {
+            pub fn pkcsv1_5(self: @This(), comptime Hash: type) PKCS1v1_5(Hash).Signature {
                 return PKCS1v1_5(Hash).Signature{ .bytes = self.bytes };
             }
         };
@@ -406,7 +406,7 @@ pub fn Rsa(comptime modulus_bits: usize) type {
                             0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x03, 0x05,
                             0x00, 0x04, 0x40,
                         },
-                        else => @compileError("unknown Hash"),
+                        else => @compileError("unknown Hash " ++ @typeName(Hash)),
                     };
                 }
             };

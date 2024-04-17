@@ -11,6 +11,8 @@
 const std = @import("std");
 const DateTime = std.DateTime;
 
+const log = std.log.scoped(.der);
+
 pub const Parser = struct {
     bytes: []const u8,
     index: u32 = 0,
@@ -36,7 +38,6 @@ pub const Parser = struct {
         };
     }
 
-    /// For UTCTime 2-digit years are interpretted according to RFC 5280 (>= 50 = 1900s, else 2000s)
     pub fn nextDateTime(self: *Parser) !DateTime {
         const ele = try self.next(.universal, false, null);
         const bytes = self.view(ele);
@@ -68,7 +69,7 @@ pub const Parser = struct {
                 date.year = try parseYear4(bytes[0..4]);
                 date.month = @enumFromInt(try parseTimeDigits(bytes[4..6], 1, 12));
                 date.day = try parseTimeDigits(bytes[6..8], 1, 31);
-                const time = try parseTime(bytes[10..16]);
+                const time = try parseTime(bytes[8..14]);
 
                 return DateTime{ .date = date, .time = time };
             },
@@ -78,7 +79,14 @@ pub const Parser = struct {
 
     pub fn nextEnum(self: *Parser, comptime Enum: type) !Enum {
         const ele = try self.next(.universal, false, .object_identifier);
-        return Enum.oids.get(self.view(ele)) orelse return error.UnknownObjectId;
+        return Enum.oids.get(self.view(ele)) orelse {
+            const oid = Oid{ .bytes = self.view(ele) };
+            var buffer: [256]u8 = undefined;
+            var stream = std.io.fixedBufferStream(&buffer);
+            oid.toString(stream.writer()) catch {};
+            log.warn("unknown oid {s}", .{ stream.getWritten() });
+            return error.UnknownObjectId;
+        };
     }
 
     pub fn nextSequence(self: *Parser) !Element {
@@ -165,45 +173,55 @@ pub const Element = struct {
     };
 
     pub fn init(bytes: []const u8, index: u32) !Element {
-        if (bytes[index..].len < 2) return error.InvalidElement;
+        var stream = std.io.fixedBufferStream(bytes[index..]);
+        var reader = stream.reader();
 
-        var i = index;
-        const identifier = @as(Identifier, @bitCast(bytes[i]));
-        i += 1;
-        const size_byte = bytes[i];
-        i += 1;
+        const identifier = @as(Identifier, @bitCast(try reader.readByte()));
+        const size_or_len_size = try reader.readByte();
 
-        var end = i;
-        if ((size_byte >> 7) == 0) {
-            end += size_byte;
+        var start = index + 2;
+        // short form between 0-127
+        if (size_or_len_size  < 128) {
+            const end = start + size_or_len_size;
             if (end > bytes.len) return error.InvalidLength;
 
-            return .{
-                .identifier = identifier,
-                .slice = .{ .start = i, .end = end },
-            };
+            return .{ .identifier = identifier, .slice = .{ .start = start, .end = end } };
         }
 
-        const len_size = @as(u7, @truncate(size_byte));
-        if (len_size > @sizeOf(u32)) return error.InvalidLength;
+        // long form between 0 and std.math.maxInt(u1024)
+        const len_size: u7 = @truncate(size_or_len_size);
+        start += len_size;
+        // cutoff at std.math.maxInt(u32)
+        if (len_size > 4) return error.InvalidLength;
+        const len = try reader.readVarInt(u32, .big, len_size);
+        if (len < 128) return error.InvalidLength; // should have used short form
 
-        const end_i = i + len_size;
-        if (end_i > bytes.len) return error.InvalidElement;
-        var long_form_size: u32 = 0;
-        while (i < end_i) : (i += 1) {
-            long_form_size = (long_form_size << 8) | bytes[i];
-        }
-
-        if (long_form_size <= (1 << 7)) return error.InvalidEncoding; // long form should be short form
-        end = std.math.add(u32, i, long_form_size) catch return error.InvalidEncoding;
-
+        const end = std.math.add(u32, start, len) catch return error.InvalidLength;
         if (end > bytes.len) return error.InvalidLength;
-        return .{
-            .identifier = identifier,
-            .slice = .{ .start = i, .end = end },
-        };
+
+        return .{ .identifier = identifier, .slice = .{ .start = start, .end = end } };
     }
 };
+
+test "der element" {
+    const short_form = [_]u8{ 0x30, 0x03, 0x02, 0x01, 0x09 };
+    try std.testing.expectEqual(
+        Element{
+            .identifier = Identifier{ .tag  = .sequence, .constructed = true, .class = .universal },
+            .slice = .{ .start = 2, .end = short_form.len },
+        },
+        Element.init(&short_form, 0)
+    );
+
+    const long_form = [_]u8{ 0x30, 129, 129 } ++ [_]u8{ 0 } ** 129;
+    try std.testing.expectEqual(
+        Element{
+            .identifier = Identifier{ .tag  = .sequence, .constructed = true, .class = .universal },
+            .slice = .{ .start = 3, .end = long_form.len },
+        },
+        Element.init(&long_form, 0)
+    );
+}
 
 fn parseTimeDigits(
     text: *const [2]u8,
@@ -298,6 +316,10 @@ pub const Identifier = packed struct(u8) {
 pub const BitString = struct {
     bytes: []const u8,
     right_padding: u3,
+
+    pub fn bitLen(self: BitString) usize {
+        return self.bytes.len * 8 + self.right_padding;
+    }
 };
 
 pub const Oid = struct {
@@ -353,7 +375,7 @@ pub const Oid = struct {
         return .{ .bytes = buf[0..i] };
     }
 
-    pub fn toString(self: Oid, writer: std.io.AnyWriter) !void {
+    pub fn toString(self: Oid, writer: anytype) !void {
         const first = @divTrunc(self.bytes[0], 40);
         const second = self.bytes[0] - first * 40;
         try writer.print("{d}.{d}", .{ first, second });

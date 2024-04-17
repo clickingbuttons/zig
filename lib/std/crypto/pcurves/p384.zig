@@ -8,7 +8,7 @@ const IdentityElementError = crypto.errors.IdentityElementError;
 const NonCanonicalError = crypto.errors.NonCanonicalError;
 const NotSquareError = crypto.errors.NotSquareError;
 
-/// Group operations over P384.
+/// secp384r1
 pub const P384 = struct {
     /// The underlying prime field.
     pub const Fe = @import("p384/field.zig").Fe;

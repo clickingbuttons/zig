@@ -18,7 +18,7 @@ pub const CompressedScalar = [encoded_length]u8;
 
 const Fe = Field(.{
     .fiat = @import("secp256k1_scalar_64.zig"),
-    .field_order = 115792089237316195423570985008687907852837564279074904382605163141518161494337,
+    .field_order = 0xfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141,
     .field_bits = 256,
     .saturated_bits = 256,
     .encoded_length = encoded_length,

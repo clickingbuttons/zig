@@ -9,7 +9,7 @@ const IdentityElementError = crypto.errors.IdentityElementError;
 const NonCanonicalError = crypto.errors.NonCanonicalError;
 const NotSquareError = crypto.errors.NotSquareError;
 
-/// Group operations over secp256k1.
+/// secp256k1
 pub const Secp256k1 = struct {
     /// The underlying prime field.
     pub const Fe = @import("secp256k1/field.zig").Fe;
