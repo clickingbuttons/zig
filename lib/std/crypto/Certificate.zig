@@ -68,14 +68,13 @@ pub fn verify(subject: Cert, issuer: Cert, now_sec: i64, is_client: bool) !void 
 }
 
 pub fn verifyHostName(sub: Cert, host_name: []const u8) !void {
-    var has_aliases = false;
     var iter = try sub.subjectAliasesIter();
-    while (try iter.next()) |alias| {
-        has_aliases = true;
-        if (checkHostName(host_name, alias)) return;
-    }
-    if (!has_aliases) {
-        if (checkHostName(host_name, sub.subject.common_name)) return;
+    if (iter.seq.slice.len() > 0) {
+        while (try iter.next()) |alias| {
+            if (checkHostName(host_name, alias)) return;
+        }
+    } else {
+        if (checkHostName(host_name, sub.subject.common_name.data)) return;
     }
 
     return error.CertificateHostMismatch;
@@ -698,8 +697,8 @@ pub const Signature = struct {
         // RFC 4055 S3.1
         const RsaPss = struct {
             hash: HashTag,
-            mask_gen: MaskGen,
-            salt_len: u8,
+            mask_gen: MaskGen = .{ .tag = .mgf1, .hash = .sha256 },
+            salt_len: u8 = 32,
 
             pub fn fromDer(parser: *der.Parser) !RsaPss {
                 const body = try parser.nextSequence();
@@ -749,7 +748,7 @@ pub const Signature = struct {
         };
     };
 
-    const Value = union(PubKeyTag) {
+    pub const Value = union(PubKeyTag) {
         rsa2048: Rsa2048.Signature,
         rsa3072: Rsa3072.Signature,
         rsa4096: Rsa4096.Signature,
