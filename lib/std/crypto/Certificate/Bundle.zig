@@ -7,9 +7,9 @@ bytes: std.ArrayListUnmanaged(u8) = .{},
 
 const log = std.log.scoped(.certificate_bundle);
 
-pub fn verify(self: Bundle, subject: Certificate, now_sec: i64) !void {
+pub fn verify(self: Bundle, subject: Certificate, now_sec: i64, is_client: bool) !void {
     const issuer = self.issuers.get(subject.issuer) orelse return error.CertificateIssuerNotFound;
-    try subject.verify(issuer, now_sec);
+    try subject.verify(issuer, now_sec, is_client);
 }
 
 pub fn deinit(self: *Bundle, gpa: Allocator) void {
@@ -253,5 +253,5 @@ test verify {
     const cert = try Certificate.fromDer(cert_bytes);
 
     // Wed 2024-04-17
-    try bundle.verify(cert, 1713312664);
+    try bundle.verify(cert, 1713312664, true);
 }

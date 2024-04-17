@@ -38,13 +38,27 @@ const Cert = @This();
 /// Verifies:
 ///  * The subject's issuer is indeed the provided issuer.
 ///  * The time validity of the subject.
-///  * The `issuer`'s signature is modern and valid.
-///  * Usage matches key usage (if present).
-///  * Usage matches extended key usage (if present).
-pub fn verify(subject: Cert, issuer: Cert, now_sec: i64) !void {
+///  * The subject and issuer usage and extended usage flags match (if present).
+///  * The `issuer`'s signature uses a secure algorithm and is valid.
+pub fn verify(subject: Cert, issuer: Cert, now_sec: i64, is_client: bool) !void {
     if (!subject.issuer.eql(issuer.subject)) return error.CertificateIssuerMismatch;
+
     if (now_sec < subject.validity.not_before) return error.CertificateNotYetValid;
     if (now_sec > subject.validity.not_after) return error.CertificateExpired;
+
+    if (subject.key_usage) |usage| {
+        if (!usage.digital_signature) return error.InvalidKeyUsage;
+    }
+    if (issuer.key_usage) |usage| {
+        if (!usage.key_cert_sign) return error.InvalidKeyUsage;
+    }
+    if (subject.key_usage_ext) |usage| {
+        if (is_client) {
+            if (!usage.client_auth) return error.InvalidKeyUsage;
+        } else {
+            if (!usage.server_auth) return error.InvalidKeyUsage;
+        }
+    }
 
     const signature = Signature{
         .algo = subject.signature_algo,
@@ -171,18 +185,65 @@ pub fn fromDer(bytes: []const u8) !Cert {
 }
 
 fn parseExtensions(res: *Cert, parser: *der.Parser) !void {
+    // the extensions we parse are focused on client-side validation
     const ExtensionTag = enum {
-        unknown,
+        // standard extensions
+        /// Fingerprint to identify public key corresponding to private key (unused).
+        authority_key_identifier,
+        /// Fingerprint to identify public key (unused).
+        subject_key_identifier,
+        /// Purpose of key (see `KeyUsage`).
         key_usage,
+        /// Policies that cert was issued under (domain verification, etc.) (unused).
+        certificate_policies,
+        /// Map of issuing CA policy considered equivalent to subject policy (unused).
+        policy_mappings,
+        /// Alternative names besides specified `subject`. Usually DNS entries.
         subject_alt_name,
-        key_usage_ext,
+        /// Alternative names besides specified `issuer` (unused).
+        /// S4.2.1.7 states: Issuer alternative names are not
+        /// processed as part of the certification path validation algorithm in
+        /// Section 6.
+        issuer_alt_name,
+        /// Nationality of subject
+        subject_directory_attributes,
+        /// Identify if is CA and maximum depth of valid cert paths including this cert.
         basic_constraints,
+        /// For CA certificates, indicates a name space within which all subject names in
+        /// subsequent certificates in a certification path MUST be located (unused).
+        name_constraints,
+        /// For CA certificates, can be used to prohibit policy mapping or require
+        /// that each certificate in a path contain an acceptable policy
+        /// identifier.
+        policy_constraints,
+        /// Purpose of key (see `KeyUsageExt`).
+        key_usage_ext,
+        /// Where to find Certificate Revocation List (unused).
+        crl_distribution_points,
+        /// For CA certificates, indicates that the special anyPolicy OID is NOT
+        /// considered an explicit match for other certificate policies.
+        inhibit_anypolicy,
+
+        // non-standard extensions
+        unknown,
 
         pub const oids = std.ComptimeStringMap(@This(), .{
+            .{ &comptimeOid("2.5.29.1"), .authority_key_identifier }, // deprecated
+            .{ &comptimeOid("2.5.29.14"), .subject_key_identifier },
             .{ &comptimeOid("2.5.29.15"), .key_usage },
             .{ &comptimeOid("2.5.29.17"), .subject_alt_name },
-            .{ &comptimeOid("2.5.29.37"), .key_usage_ext },
+            .{ &comptimeOid("2.5.29.18"), .issuer_alt_name },
             .{ &comptimeOid("2.5.29.19"), .basic_constraints },
+            .{ &comptimeOid("2.5.29.25"), .crl_distribution_points }, // deprecated
+            .{ &comptimeOid("2.5.29.29"), .subject_directory_attributes },
+            .{ &comptimeOid("2.5.29.30"), .name_constraints },
+            .{ &comptimeOid("2.5.29.31"), .crl_distribution_points },
+            .{ &comptimeOid("2.5.29.32"), .certificate_policies },
+            .{ &comptimeOid("2.5.29.33"), .policy_mappings },
+            .{ &comptimeOid("2.5.29.34"), .policy_constraints },
+            .{ &comptimeOid("2.5.29.35"), .authority_key_identifier },
+            .{ &comptimeOid("2.5.29.37"), .key_usage_ext },
+            .{ &comptimeOid("2.5.29.54"), .inhibit_anypolicy },
         });
     };
     const seq = try parser.nextSequence();
@@ -226,6 +287,17 @@ fn parseExtensions(res: *Cert, parser: *der.Parser) !void {
                 //     if (is_ca) res.max_depth = @bitCast(max_depth);
                 // }
             },
+            .authority_key_identifier,
+            .subject_key_identifier,
+            .certificate_policies,
+            .policy_mappings,
+            .issuer_alt_name,
+            .subject_directory_attributes,
+            .name_constraints,
+            .policy_constraints,
+            .crl_distribution_points,
+            .inhibit_anypolicy,
+            => {}
         }
     }
 }
@@ -378,6 +450,7 @@ pub const Name = struct {
     common_name: DirectoryString = empty,
     serial_number: DirectoryString = empty,
     domain_component: []const u8 = "",
+
     // may implement
     locality: DirectoryString = empty,
     title: DirectoryString = empty,
@@ -386,16 +459,20 @@ pub const Name = struct {
     initials: DirectoryString = empty,
     pseudonym: DirectoryString = empty,
     generation_qualifier: DirectoryString = empty,
-    // in root certs
+
+    // not in RFC but found in real CA certs
     organization_id: DirectoryString = empty,
     /// deprecated in favor of altName extension
     email_address: []const u8 = "",
-    /// for unknown fields
+
+    /// for unknown fields. holds opaque sequence.
+    kvs: KVs = [_][]const u8{""} ** unknown_len,
     kvs_len: u8 = 0,
-    kvs: KVs = [_][]const u8{""} ** 7,
 
     const empty = DirectoryString{ .tag = .utf8, .data = "" };
-    pub const KVs = [7][]const u8;
+    const unknown_len = 7;
+
+    pub const KVs = [unknown_len][]const u8;
 
     pub fn fromDer(parser: *der.Parser) !Name {
         var res = Name{};
@@ -478,7 +555,7 @@ pub const Name = struct {
         }
     };
 
-    /// TODO: use unicode mapping, lowering, and normalization in RFC 5280 S7.1
+    /// TODO: Use unicode mapping, lowering, and normalization in section 7.1.
     /// Will require unicode mapping tables from RFC 4818 and RFC 3454.
     ///
     /// This version is stricter but less internationalized.
@@ -756,7 +833,7 @@ pub const KeyUsage = packed struct {
     data_encipherment: bool = false,
     key_encipherment: bool = false,
     content_commitment: bool = false,
-    digital_signature: bool = true,
+    digital_signature: bool = false,
 
     decipher_only: bool = false,
 
