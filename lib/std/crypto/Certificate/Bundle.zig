@@ -7,9 +7,9 @@ bytes: std.ArrayListUnmanaged(u8) = .{},
 
 const log = std.log.scoped(.certificate_bundle);
 
-pub fn verify(self: Bundle, subject: Certificate, now_sec: i64, is_client: bool) !void {
+pub fn verify(self: Bundle, subject: Certificate, now_sec: i64, options: Certificate.VerifyOptions) !void {
     const issuer = self.issuers.get(subject.issuer) orelse return error.CertificateIssuerNotFound;
-    try subject.verify(issuer, now_sec, is_client);
+    try subject.verify(issuer, now_sec, options);
 }
 
 pub fn deinit(self: *Bundle, gpa: Allocator) void {
@@ -19,6 +19,8 @@ pub fn deinit(self: *Bundle, gpa: Allocator) void {
 }
 
 /// Replaces `issuers` by parsing the host operating system file system standard location.
+///
+/// Only adds certificates with proper CA fields set.
 pub fn rescan(self: *Bundle, gpa: Allocator) !void {
     self.issuers.clearRetainingCapacity();
     self.bytes.clearRetainingCapacity();
@@ -186,50 +188,36 @@ pub fn addCertsFromPem(cb: *Bundle, gpa: Allocator, pem: []const u8) !void {
     }
 }
 
+inline fn fmtCert(cert: Certificate) []const u8 {
+    var buf: [256]u8 = undefined;
+    var stream = std.io.fixedBufferStream(&buf);
+    const writer = stream.writer();
+
+    cert.print(writer) catch {};
+
+    return stream.getWritten();
+}
+
 pub fn parseCert(cb: *Bundle, gpa: Allocator, decoded_start: u32, now_sec: i64) !void {
     const cert = Certificate.fromDer(cb.bytes.items[decoded_start..]) catch |err| {
-        // may lead to valid certificates appearing invalid
-        log.warn("could not parse cert: {}", .{ err });
+        log.warn("parse: {}", .{ err });
         return;
     };
-    cert.signature_algo.verify() catch |err| {
-        std.debug.assert(err == error.InsecureHash);
-        // The cert bundler kept these certs so that implementations supporting
-        // insecure signature algorithms can update their cert bundle
-        // without breaking compatibility.
-        //
-        // Since we're a new implementation that doesn't support insecure
-        // signature algorithms (and `verify` will never pass them), skip them.
-        var serial_number_buf: [48]u8 = undefined; // spec says up to 20
-        const len = @min(serial_number_buf.len, cert.serial_number.len);
-        @memcpy(serial_number_buf[0..len], cert.serial_number[0..len]);
-        const serial_number = std.fmt.bytesToHex(serial_number_buf, .lower)[0..len * 2];
-
-        const from = std.DateTime.fromEpoch(cert.validity.not_before).date;
-        const to = std.DateTime.fromEpoch(cert.validity.not_after).date;
-
-        // shame on you for issuing such a long lasting cert with a
-        // signature algorithm that was later broken.
-        // how did the cert bundler trust you in the first place?
-        log.debug(
-            "skipping cert {s} with insecure {}." ++
-            " issued by {s} from {d}-{d}-{d} to {d}-{d}-{d}.", .{
-            serial_number,
-            cert.signature_algo,
-            cert.issuer.organization.data,
-            from.year, from.month.numeric(), from.day,
-            to.year, to.month.numeric(), to.day,
-        });
+    if (!cert.basic_constraints.is_ca) {
+        log.debug("skipping {s} that is not a CA", .{ fmtCert(cert) });
         return;
+    }
+    cert.validate(now_sec) catch |err| switch (err) {
+        error.CertificateNotYetValid => {}, // it may become valid while this program is running
+        else => {
+            log.debug("skipping {s}: {}", .{ fmtCert(cert), err });
+            return;
+        }
     };
-    if (now_sec > cert.validity.not_after) return;
 
     const gop = try cb.issuers.getOrPut(gpa, cert.subject);
-    if (gop.found_existing) {
-        std.debug.print("dup {}\n", .{ cert });
-    } else {
-        gop.value_ptr.* = cert;
-    }
+    gop.value_ptr.* = cert;
+    if (gop.found_existing) log.warn("overwriting {}\n", .{ cert });
 }
 
 const builtin = @import("builtin");
@@ -293,5 +281,5 @@ test verify {
     const cert = try Certificate.fromDer(cert_bytes);
 
     // Wed 2024-04-17
-    try bundle.verify(cert, 1713312664, true);
+    try bundle.verify(cert, 1713312664, .{ .path_len = 1 });
 }

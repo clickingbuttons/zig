@@ -1,68 +1,120 @@
 //! RFC 5280: Internet X.509 Public Key Infrastructure (PKI) Certificate
 //!
-//! Follows Mozilla's Certificate policy but additionally disallows SHA1.
-//! https://www.mozilla.org/en-US/about/governance/policies/security-group/certs/policy/#5-certificates
-//!
-//! Certificate Revocation Lists currently unimplemented since they need frequent updates
-//! and there is not a standard installation location.
+//! Certificate Revocation Lists (CRLs) currently unimplemented
+//! because they need frequent updates and there is no standard
+//! installation location.
 
 version: Version,
+/// The To Be Signed part of the certificate.
+/// This is the start of serial number to end of extensions.
+tbs_bytes: []const u8,
+/// Unique for each certificate issued by a given CA
 serial_number: []const u8,
 issuer: Name,
 validity: Validity,
 subject: Name,
 pub_key: PubKey,
-/// Extension. Since we don't allocate, get slices from `subjectAliasesIter()`
-subject_aliases_raw_der: ?[]const u8 = null,
-/// Extension for how `pub_key` may be used.
-key_usage: ?KeyUsage = null,
-/// Extension further specifying how `pub_key` may be used.
-key_usage_ext: ?KeyUsageExt = null,
-/// Extension specifying maximum number of non-self-issued intermediate certificates that may
-/// follow this certificate in a valid certification path.
-max_depth: ?u8 = null,
+
+// Extensions. All from RFC 5280 are implemented except:
+//   - Authority key identifier
+//   - Policy constraints
+//   - Policy mappings
+//   - Issuer alternative name
+//   - Subject directory attributes
+//   - Name constraints
+//   - CRL distribution points
+//   - Inhibit anyPolicy
+//   - Freshest CRL
+subject_key_identifier: ?[]const u8 = null,
+key_usage: KeyUsage = .{},
+basic_constraints: BasicConstraints = .{},
+/// See `policiesIter`.
+policies: ?[]const u8 = null,
+key_usage_ext: KeyUsageExt = .{},
+/// See `subjectAliasesIter`.
+subject_aliases: ?[]const u8 = null,
+
 /// Algorithm family and parameters.
 /// Does NOT include signature's public key type.
 signature_algo: Signature.Algorithm,
-/// Signature from a higher level certificate.
+/// Signature from `issuer`.
 ///
-/// We could guess the type from the length but for ECDSA different curves have similar lengths.
+/// The type is not `Signature` because we cannot infer the type from the length.
+/// Different ECDSA curves have equal lengths.
 signature: der.BitString,
-/// The part of the certificate that is signed (start of serial number to end of extensions).
-tbs_bytes: []const u8,
 
-const Cert = @This();
+pub const VerifyOptions = struct {
+    issuer: Validator = .{
+        .key_usage = .{ .key_cert_sign = .set_or_null },
+    },
+    subject: Validator = .{
+        .key_usage = .{ .digital_signature = .set_or_null },
+        .key_usage_ext = .{ .client_auth = .set_or_null },
+    },
+    /// How many certificates in the chain have been validated so far.
+    path_len: u32 = 0,
 
-/// Verify `subject` is trusted by `issuer`.
+    pub const Validator = struct {
+        key_usage: KeyUsage.Verifier = .{},
+        key_usage_ext: KeyUsageExt.Verifier = .{},
+    };
+};
+
+pub const Flag = enum {
+    ignore,
+    set,
+    set_or_null,
+
+    pub fn verify(self: Flag, value: ?bool) bool {
+        switch (self) {
+            .ignore => {},
+            .set => return value == true,
+            .set_or_null => if (value) |v| return v,
+        }
+        return true;
+    }
+};
+
+/// Verify `subject` is trusted by `issuer` according to RFC 5280 S6.
 ///
 /// Verifies:
-///  * The subject's issuer is indeed the provided issuer.
-///  * The time validity of the subject.
-///  * The subject and issuer usage and extended usage flags match (if present).
-///  * The subject and issuer use a secure signature algorithm.
-///  * `issuer.signature` is valid for `subject.tbs_bytes`.
-pub fn verify(subject: Cert, issuer: Cert, now_sec: i64, is_client: bool) !void {
+///  * `subject.issuer == issuer.subject`
+///  * `subject` and `issuer` contain valid combinations of fields according to RFC 5280.
+///    SHA1 signature hashing algorithms are considered invalid.
+///  * The time validity of the subject and issuer.
+///  * `issuer.basic_constraints` are met.
+///  * Subject and issuer key usage and extended key usage flags match those specified in options.
+///  * If present, the issuer has at least one policy compatible with the subject's policy.
+///  * `issuer.signature` is valid for `subject.tbs_bytes`. Valid algorithms are those listed in
+///    Mozilla's Certificate policy [1], except for SHA1.
+///
+/// [1] https://www.mozilla.org/en-US/about/governance/policies/security-group/certs/policy/#5-certificates
+pub fn verify(subject: Cert, issuer: Cert, now_sec: i64, options: VerifyOptions) !void {
     if (!subject.issuer.eql(issuer.subject)) return error.CertificateIssuerMismatch;
 
-    if (now_sec < subject.validity.not_before) return error.CertificateNotYetValid;
-    if (now_sec > subject.validity.not_after) return error.CertificateExpired;
+    try subject.validate(now_sec);
+    try issuer.validate(now_sec);
 
-    if (subject.key_usage) |usage| {
-        if (!usage.digital_signature) return error.InvalidKeyUsage;
+    try subject.key_usage.verify(options.subject.key_usage);
+    try issuer.key_usage.verify(options.issuer.key_usage);
+    try subject.key_usage_ext.verify(options.subject.key_usage_ext);
+    try issuer.key_usage_ext.verify(options.issuer.key_usage_ext);
+
+    if (issuer.basic_constraints.max_path_len) |max_path_len| {
+        if (options.path_len > max_path_len) return error.PathTooLong;
     }
-    if (issuer.key_usage) |usage| {
-        if (!usage.key_cert_sign) return error.InvalidKeyUsage;
-    }
-    if (subject.key_usage_ext) |usage| {
-        if (is_client) {
-            if (!usage.client_auth) return error.InvalidKeyUsage;
-        } else {
-            if (!usage.server_auth) return error.InvalidKeyUsage;
+
+    var issuer_policies = issuer.policiesIter();
+    const anyPolicy = comptimeOid("2.5.29.32.0");
+    while (try issuer_policies.next()) |ip| brk: {
+        if (std.mem.eql(u8, ip.oid.bytes, &anyPolicy)) break;
+
+        var subject_policies = subject.policiesIter();
+        while (try subject_policies.next()) |sp| {
+            if (std.mem.eql(u8, ip.oid.bytes, sp.oid.bytes)) break :brk;
         }
+        return error.IssuerPolicyNotMet;
     }
-
-    try subject.signature_algo.verify();
-    try issuer.signature_algo.verify();
 
     const signature = Signature{
         .algo = subject.signature_algo,
@@ -72,8 +124,8 @@ pub fn verify(subject: Cert, issuer: Cert, now_sec: i64, is_client: bool) !void 
 }
 
 pub fn verifyHostName(sub: Cert, host_name: []const u8) !void {
-    var iter = try sub.subjectAliasesIter();
-    if (iter.seq.slice.len() > 0) {
+    var iter = sub.subjectAliasesIter();
+    if (iter.parser.bytes.len > 0) {
         while (try iter.next()) |alias| {
             if (checkHostName(host_name, alias)) return;
         }
@@ -107,10 +159,11 @@ fn checkHostName(host_name: []const u8, dns_name: []const u8) bool {
 test checkHostName {
     try testing.expectEqual(true, checkHostName("foo.a.com", "*.a.com"));
     try testing.expectEqual(false, checkHostName("bar.foo.a.com", "*.a.com"));
+
+    try testing.expectEqual(false, checkHostName("bar.com", "f*.com"));
     // rfc2818 says this should match, but rfc4952 disagrees.
     // since rfc4952 came later and CAs tend to follow it, prefer its rules
     try testing.expectEqual(false, checkHostName("foo.com", "f*.com"));
-    try testing.expectEqual(false, checkHostName("bar.com", "f*.com"));
 }
 
 pub const ParseError = der.Parser.Error || error{};
@@ -151,7 +204,6 @@ pub fn fromDer(bytes: []const u8) !Cert {
 
             const serial_number = try parser.nextPrimitive(.integer);
             res.serial_number = parser.view(serial_number);
-            // this field MUST match the later `signature` field
             res.signature_algo = try Signature.Algorithm.fromDer(&parser);
 
             res.issuer = try Name.fromDer(&parser);
@@ -178,6 +230,7 @@ pub fn fromDer(bytes: []const u8) !Cert {
             }
         }
 
+        // this field MUST match the earlier `signature` field
         const sig_algo2 = try Signature.Algorithm.fromDer(&parser);
         if (!std.meta.eql(res.signature_algo, sig_algo2)) return error.SigAlgoMismatch;
 
@@ -248,12 +301,12 @@ fn parseExtensions(res: *Cert, parser: *der.Parser) !void {
             .{ &comptimeOid("2.5.29.54"), .inhibit_anypolicy },
         });
     };
-    const seq = try parser.nextSequence();
-    defer parser.seek(seq.slice.end);
+    const extensions_seq = try parser.nextSequence();
+    defer parser.seek(extensions_seq.slice.end);
 
-    while (parser.index != seq.slice.end) {
-        const seq2 = try parser.nextSequence();
-        defer parser.seek(seq2.slice.end);
+    while (parser.index != extensions_seq.slice.end) {
+        const extension_seq = try parser.nextSequence();
+        defer parser.seek(extension_seq.slice.end);
 
         const oid_ele = try parser.nextOid();
         const tag = ExtensionTag.oids.get(parser.view(oid_ele)) orelse .unknown;
@@ -263,7 +316,37 @@ fn parseExtensions(res: *Cert, parser: *der.Parser) !void {
         };
         const doc = try parser.nextPrimitive(.octetstring);
         const doc_bytes = parser.view(doc);
+        var doc_parser = der.Parser{ .bytes = doc_bytes };
         switch (tag) {
+            .key_usage => {
+                res.key_usage = try KeyUsage.fromDer(doc_bytes);
+            },
+            .key_usage_ext => {
+                res.key_usage_ext = try KeyUsageExt.fromDer(doc_bytes);
+            },
+            .subject_alt_name => {
+                const seq = try doc_parser.nextSequence();
+                res.subject_aliases = doc_parser.view(seq);
+            },
+            .basic_constraints => {
+                res.basic_constraints = try BasicConstraints.fromDer(doc_bytes);
+            },
+            .subject_key_identifier => {
+                const string = try doc_parser.nextPrimitive(.octetstring);
+                res.subject_key_identifier = doc_parser.view(string);
+            },
+            .certificate_policies => {
+                const seq = try doc_parser.nextSequence();
+                res.policies = doc_parser.view(seq);
+            },
+            .authority_key_identifier,
+            .policy_mappings,
+            .issuer_alt_name,
+            .subject_directory_attributes,
+            .name_constraints,
+            .policy_constraints,
+            .crl_distribution_points,
+            .inhibit_anypolicy,
             .unknown => {
                 const oid = Oid{ .bytes = parser.view(oid_ele) };
                 var buffer: [256]u8 = undefined;
@@ -273,53 +356,40 @@ fn parseExtensions(res: *Cert, parser: *der.Parser) !void {
                 if (critical) {
                     log.err("critical unknown extension {s}", .{ stream.getWritten() });
                     return error.UnimplementedCriticalExtension;
-                } else {
+                } else if (tag == .unknown) {
                     log.debug("skipping unknown extension {s}", .{ stream.getWritten() });
                 }
             },
-            .key_usage => {
-                res.key_usage = try KeyUsage.fromDer(doc_bytes);
-            },
-            .key_usage_ext => {
-                var parser2 = der.Parser{ .bytes = doc_bytes };
-                res.key_usage_ext = try KeyUsageExt.fromDer(&parser2);
-            },
-            .subject_alt_name => {
-                res.subject_aliases_raw_der = doc_bytes;
-            },
-            .basic_constraints => {
-                // var parser2 = der.Parser{ .bytes = doc_bytes };
-                // const seq3 = try parser2.nextSequence();
-                // if (seq3.slice.len() > 0) {
-                //     const is_ca = try parser2.nextBool();
-                //     const max_depth = try parser2.nextInt(i8);
-                //     if (max_depth < 0) return error.InvalidBasicConstraints;
-                //     if (is_ca) res.max_depth = @bitCast(max_depth);
-                // }
-            },
-            .authority_key_identifier,
-            .subject_key_identifier,
-            .certificate_policies,
-            .policy_mappings,
-            .issuer_alt_name,
-            .subject_directory_attributes,
-            .name_constraints,
-            .policy_constraints,
-            .crl_distribution_points,
-            .inhibit_anypolicy,
-            => {}
         }
     }
 }
 
+/// Validates:
+///   - Serial number is less than or equal to 20 bytes.
+///   - Key usage matches basic constraints.
+///   - Signature algorithm is secure.
+///   - Time validity.
+pub fn validate(self: Cert, now_sec: i64) !void {
+    if (self.serial_number.len > 20) return error.InvalidSerialNumber;
+    if (self.key_usage.key_cert_sign and !self.basic_constraints.is_ca) return error.KeySignAndNotCA;
+    try self.signature_algo.validate();
+    // This check should optimally be at the end so that `Bundle.parseCert` does not add
+    // certs that may be valid in the future but fail the above checks.
+    //
+    // Such certs would fail all `verify` checks.
+    try self.validity.validate(now_sec);
+}
+
 pub const SubjectAliasesIter = struct {
     parser: der.Parser,
-    seq: der.Element,
 
     /// Next dnsName (RFC 5280 S4.2.1.6)
     pub fn next(it: *@This()) !?[]const u8 {
-        while (it.parser.index < it.seq.slice.end) {
-            const ele = try it.parser.next(.context_specific, null, null);
+        while (true) {
+            const ele = it.parser.next(.context_specific, null, null) catch |err| switch (err) {
+                error.EndOfStream => return null,
+                else => return err,
+            };
             switch (@intFromEnum(ele.identifier.tag)) {
                 2 => return it.parser.view(ele),
                 else => {
@@ -330,26 +400,83 @@ pub const SubjectAliasesIter = struct {
         }
         return null;
     }
+};
 
-    /// Reset the iterator to the initial index
-    pub fn reset(it: *@This()) void {
-        it.parser.index = it.seq.slice.start;
+fn subjectAliasesIter(c: Cert) SubjectAliasesIter {
+    const bytes = if (c.subject_aliases) |b| b else "";
+    return SubjectAliasesIter{ .parser = der.Parser{ .bytes = bytes } };
+}
+
+pub const Policy = struct {
+    oid: Oid,
+    // Should have a qualifiers field here as an extra verification option,
+    // but they'll need their own iterators which is messy.
+    //
+    // We can securely ignore them for now since the spec reads:
+    // > Optional qualifiers, which
+    // > MAY be present, are not expected to change the definition of the
+    // > policy.
+};
+
+pub const PoliciesIter = struct {
+    parser: der.Parser,
+
+    pub fn next(it: *@This()) !?Policy {
+        while (true) {
+            const seq = it.parser.nextSequence() catch |err| switch (err) {
+                error.EndOfStream => return null,
+                else => return err,
+            };
+            defer it.parser.seek(seq.slice.end);
+
+            const ele = try it.parser.nextOid();
+            return Policy{
+                .oid = der.Oid{ .bytes = it.parser.view(ele) }
+            };
+        }
+        return null;
     }
 };
 
-fn subjectAliasesIter(c: Cert) !SubjectAliasesIter {
-    if (c.subject_aliases_raw_der) |bytes| {
-        var parser = der.Parser{ .bytes = bytes };
-        const seq = try parser.nextSequence();
-        return SubjectAliasesIter{ .parser = parser, .seq = seq };
-    } else {
-        const parser = der.Parser{ .bytes = "" };
-        const empty_ele = der.Element{
-            .identifier = .{ .tag = .sequence, .constructed = true, .class = .universal },
-            .slice = .{ .start = 0, .end = 0 },
-        };
-        return SubjectAliasesIter{ .parser = parser, .seq = empty_ele };
+fn policiesIter(c: Cert) PoliciesIter {
+    const bytes = if (c.policies) |b| b else "";
+    return PoliciesIter{ .parser = der.Parser{ .bytes = bytes } };
+}
+
+inline fn fmtCert(cert: Cert) []const u8 {
+    var buf: [256]u8 = undefined;
+    var stream = std.io.fixedBufferStream(&buf);
+    const writer = stream.writer();
+
+    cert.print(writer) catch {};
+
+    return stream.getWritten();
+}
+
+pub fn print(self: Cert, writer: anytype) !void {
+    try writer.writeAll("{ ");
+
+    // Name + serial number = unique certificate.
+    const name = self.issuer;
+    if (name.organization.data.len > 0) try writer.print("O: {s}, ", .{ name.organization.data });
+    if (name.country.data.len > 0) try writer.print("C: {s}, ", .{ name.country.data });
+    if (name.common_name.data.len > 0) try writer.print("CN: {s}, ", .{ name.common_name.data });
+
+    // spec says up to 20 bytes.
+    try writer.writeAll("SN: ");
+    for (0..@min(20, self.serial_number.len)) |i| {
+        try writer.print("{x:0>2}", .{ self.serial_number[i] });
     }
+
+    // These fields are useful for tracking down the certificate on aggregators.
+    if (self.subject_key_identifier) |s| {
+        try writer.writeAll(", SKI: ");
+        for (s) |c| {
+            try writer.print("{x:0>2}", .{ c });
+        }
+    }
+
+    try writer.writeAll(" }");
 }
 
 const PubKeyTag = enum {
@@ -447,6 +574,11 @@ pub const Validity = struct {
         res.not_before = (try parser.nextDateTime()).toEpoch();
         res.not_after = (try parser.nextDateTime()).toEpoch();
         return res;
+    }
+
+    pub fn validate(self: Validity, sec: i64) !void {
+        if (sec < self.not_before) return error.CertificateNotYetValid;
+        if (sec > self.not_after) return error.CertificateExpired;
     }
 };
 
@@ -771,7 +903,7 @@ pub const Signature = struct {
             }
         }
 
-        pub fn verify(self: @This()) !void {
+        pub fn validate(self: @This()) !void {
             switch (self) {
                 .rsa_pkcs => |h| try h.verify(),
                 .rsa_pss => |info| try info.hash.verify(),
@@ -856,10 +988,51 @@ pub const Signature = struct {
     const sha2 = crypto.hash.sha2;
 };
 
+/// Extension specifying if certificate is a CA and maximum number
+/// of non self-issued intermediate certificates that may follow this
+/// Certificate in a valid certification path.
+pub const BasicConstraints = struct {
+    is_ca: bool = false,
+    /// MUST be specified if `is_ca`.
+    max_path_len: ?u8 = null,
+
+    pub fn fromDer(bytes: []const u8) !BasicConstraints {
+        var res: BasicConstraints = .{};
+
+        var parser = der.Parser{ .bytes = bytes };
+        _ = try parser.nextSequence();
+        if (!parser.eof()) {
+            res.is_ca = try parser.nextBool();
+            if (!parser.eof()) res.max_path_len = try parser.nextInt(u8);
+        }
+
+        return res;
+    }
+};
+
+fn MakeVerifier(comptime T: type) type {
+    // map each field to a flag
+    const to_copy = std.meta.fields(T);
+   var fields: [to_copy.len]std.builtin.Type.StructField = undefined;
+   for (&fields, to_copy) |*f, f2| {
+       f.* = f2;
+       f.type = Flag;
+       f.default_value = @ptrCast(&Flag.ignore);
+   }
+   return @Type(.{ .Struct = .{
+       .layout = .auto,
+       .fields = &fields,
+       .decls = &.{},
+       .is_tuple = false,
+   } });
+}
+
+/// How `pub_key` may be used.
 pub const KeyUsage = packed struct {
     // fields are in reverse bit order because of how zig packs structs
     encipher_only: bool = false,
     crl_sign: bool = false,
+    // MUST be false when basic_constraints.is_ca == false
     key_cert_sign: bool = false,
     key_agreement: bool = false,
     data_encipherment: bool = false,
@@ -880,8 +1053,18 @@ pub const KeyUsage = packed struct {
 
         return res;
     }
+
+    pub const Verifier = MakeVerifier(KeyUsage);
+    pub fn verify(self: KeyUsage, validator: Verifier) !void {
+        inline for (std.meta.fields(KeyUsage)) |f| {
+            const expected = @field(validator, f.name);
+            const actual = @field(self, f.name);
+            if (!expected.verify(actual)) return error.InvalidKeyUsage;
+        }
+    }
 };
 
+/// Further specifies how `pub_key` may be used.
 pub const KeyUsageExt = packed struct {
     server_auth: bool = false,
     client_auth: bool = false,
@@ -908,9 +1091,10 @@ pub const KeyUsageExt = packed struct {
         });
     };
 
-    pub fn fromDer(parser: *der.Parser) !KeyUsageExt {
+    pub fn fromDer(bytes: []const u8) !KeyUsageExt {
         var res: KeyUsageExt = .{};
 
+        var parser = der.Parser{ .bytes = bytes };
         const seq = try parser.nextSequence();
         defer parser.seek(seq.slice.end);
         while (parser.index != parser.bytes.len) {
@@ -929,6 +1113,15 @@ pub const KeyUsageExt = packed struct {
         }
 
         return res;
+    }
+
+    pub const Verifier = MakeVerifier(KeyUsageExt);
+    pub fn verify(self: KeyUsageExt, validator: Verifier) !void {
+        inline for (std.meta.fields(KeyUsageExt)) |f| {
+            const expected = @field(validator, f.name);
+            const actual = @field(self, f.name);
+            if (!expected.verify(actual)) return error.InvalidKeyUsage;
+        }
     }
 };
 
@@ -985,23 +1178,23 @@ fn comptimeOidFromString(comptime bytes: []const u8) Oid {
 }
 
 fn comptimeOid(comptime bytes: []const u8) [comptimeOidFromString(bytes).bytes.len]u8 {
-    const oid = comptimeOidFromString(bytes);
+    const oid = comptime comptimeOidFromString(bytes);
     return oid.bytes[0..oid.bytes.len].*;
 }
 
 const std = @import("../std.zig");
+const der = @import("der.zig");
+const rsa = @import("rsa.zig");
+pub const Bundle = @import("Certificate/Bundle.zig");
+
 const crypto = std.crypto;
 const mem = std.mem;
 const DateTime = std.date_time.DateTime;
-const Certificate = @This();
-const der = @import("der.zig");
+const Cert = @This();
 const Oid = der.Oid;
-const rsa = @import("rsa.zig");
 const ecdsa = crypto.sign.ecdsa;
 const sha2 = crypto.hash.sha2;
 const testing = std.testing;
-pub const Bundle = @import("Certificate/Bundle.zig");
-
 const Rsa2048 = rsa.Rsa2048;
 const Rsa3072 = rsa.Rsa3072;
 const Rsa4096 = rsa.Rsa4096;
@@ -1093,8 +1286,8 @@ test "certificate fromDer ecc256" {
     // extensions
     try testing.expectEqual(KeyUsage{ .digital_signature = true }, cert.key_usage);
     try testing.expectEqual(KeyUsageExt{ .client_auth = true, .server_auth = true }, cert.key_usage_ext);
-    try testing.expectEqual(null, cert.max_depth);
-    var iter = try cert.subjectAliasesIter();
+    try testing.expectEqual(BasicConstraints{}, cert.basic_constraints);
+    var iter = cert.subjectAliasesIter();
     try testing.expectEqualStrings("*.badssl.com", (try iter.next()).?);
     try testing.expectEqualStrings("badssl.com", (try iter.next()).?);
     try testing.expectEqual(null, try iter.next());

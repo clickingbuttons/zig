@@ -1,16 +1,17 @@
-//! Distinguised Encoding Rules
+//! Distinguised Encoding Rules as defined in X.690 and X.691.
 //!
 //! A version of Basic Encoding Rules (BER) where there is exactly ONE way to
 //! represent non-constructed elements. This is useful for cryptographic signatures.
-//!
-//! Defined in X.690 and X.691.
-//!
-//! Intro material:
-//!     - https://en.wikipedia.org/wiki/X.690#DER_encoding
-//!     - https://letsencrypt.org/docs/a-warm-welcome-to-asn1-and-der
+
 const std = @import("std");
 const DateTime = std.DateTime;
 
+/// A secure DER parser that:
+///   - Will NOT read memory outside `bytes`
+///   - Will NOT return elements with indices outside `bytes`.
+///   - Will error on values that do not follow DER rules.
+///         - Long field lengths that could be represented in short form.
+///         - Invalid boolean values.
 pub const Parser = struct {
     bytes: []const u8,
     index: u32 = 0,
@@ -106,17 +107,21 @@ pub const Parser = struct {
     }
 
     pub fn nextInt(self: *Parser, comptime T: type) !T {
-        const int = try self.nextInteger();
-        const bytes = self.view(int);
-        switch (@typeInfo(T)) {
-            .Int => |info| {
-                if (info.bits % 8 != 0) @compileError("DER only supports bytes");
-                if (info.signedness != .signed) @compileError("DER only supports signed ints");
+        const ele = try self.nextInteger();
+       const bytes = self.view(ele);
 
-                return std.mem.readInt(T, bytes[0..info.bits / 8], .little);
-            },
-            else => @compileError(@typeName(T) ++ " is not an int type"),
+       if (@typeInfo(T) != .Int) @compileError(@typeName(T) ++ " is not an int type");
+        const ShiftType = std.math.Log2Int(T);
+
+        var result: T = 0;
+        for (bytes, 0..) |b, index| {
+            const shifted = @shlWithOverflow(b, @as(ShiftType, @intCast(index * 8)));
+            if (shifted[1] == 1) return error.Overflow;
+
+            result = result | @as(T, @bitCast(shifted[0]));
         }
+
+        return result;
     }
 
     pub fn next(
@@ -147,6 +152,10 @@ pub const Parser = struct {
 
     pub fn seek(self: *Parser, index: u32) void {
         self.index = index;
+    }
+
+    pub fn eof(self: *Parser) bool {
+        return self.index == self.bytes.len;
     }
 };
 
@@ -218,13 +227,19 @@ test "der element" {
     );
 }
 
+test "der integer" {
+    const one = [_]u8{ 2, 1, 1 };
+    var parser = Parser{ .bytes = &one };
+    try std.testing.expectEqual(@as(u8, 1), try parser.nextInt(u8));
+}
+
 fn parseTimeDigits(
     text: *const [2]u8,
     min: comptime_int,
     max: comptime_int,
 ) !std.math.IntFittingRange(min, max) {
     const result = std.fmt.parseInt(std.math.IntFittingRange(min, max), text, 10) catch
-        return error.InvalidDateTime;
+        return error.InvalidTime;
     if (result < min) return error.InvalidTime;
     if (result > max) return error.InvalidTime;
     return result;

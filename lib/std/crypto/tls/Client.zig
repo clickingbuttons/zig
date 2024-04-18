@@ -356,7 +356,7 @@ pub fn init(stream: anytype, ca_bundle: Certificate.Bundle, host: []const u8) !C
     // * Flip back and forth between the two cleartext buffers in order to keep
     //   the previous certificate in memory so that it can be verified by the
     //   next one.
-    var cert_index: usize = 0;
+    var cert_index: u32 = 0;
     var read_seq: u64 = 0;
     var prev_cert: Certificate = undefined;
     // Set to true once a trust chain has been established from the first
@@ -476,14 +476,17 @@ pub fn init(stream: anytype, ca_bundle: Certificate.Bundle, host: []const u8) !C
                                 const certd = try certs_decoder.sub(cert_size);
 
                                 cur_cert = try Certificate.fromDer(certd.buf);
+                                const verify_options = Certificate.VerifyOptions{
+                                    .path_len = cert_index,
+                                };
                                 if (cert_index == 0) {
                                     // Verify the host on the first certificate.
                                     try cur_cert.verifyHostName(host);
                                 } else {
-                                    try prev_cert.verify(cur_cert, now_sec, true);
+                                    try prev_cert.verify(cur_cert, now_sec, verify_options);
                                 }
 
-                                if (ca_bundle.verify(cur_cert, now_sec, true)) |_| {
+                                if (ca_bundle.verify(cur_cert, now_sec, verify_options)) |_| {
                                     handshake_state = .trust_chain_established;
                                     break :cert;
                                 } else |err| switch (err) {

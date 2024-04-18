@@ -1,0 +1,19 @@
+[x] key usage
+[x] tls client
+[x] rebase
+
+// FEATURES
+[x] missing hashes
+	- [skip] DER encoder
+		- shared oids
+[x] missing extensions
+[x] other missing oids
+
+// SECURITY
+[x] max_depth
+policy
+[x] do not trust lengths
+
+// WHATEVER
+fmt
+error sets
