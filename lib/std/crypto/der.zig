@@ -76,13 +76,14 @@ pub const Parser = struct {
         }
     }
 
-    pub fn nextOid(self: *Parser) !Element {
-        return try self.next(.universal, false, .object_identifier);
+    pub fn nextOid(self: *Parser) !Oid {
+        const ele =  try self.next(.universal, false, .object_identifier);
+        return Oid{ .bytes = self.view(ele) };
     }
 
     pub fn nextEnum(self: *Parser, comptime Enum: type) !Enum {
-        const ele = try self.nextOid();
-        return Enum.oids.get(self.view(ele)) orelse return error.UnknownObjectId;
+        const oid = try self.nextOid();
+        return Enum.oids.get(oid.bytes) orelse return error.UnknownObjectId;
     }
 
     pub fn nextSequence(self: *Parser) !Element {
@@ -110,18 +111,44 @@ pub const Parser = struct {
         const ele = try self.nextInteger();
        const bytes = self.view(ele);
 
-       if (@typeInfo(T) != .Int) @compileError(@typeName(T) ++ " is not an int type");
-        const ShiftType = std.math.Log2Int(T);
+       const info = @typeInfo(T);
+       if (info != .Int) @compileError(@typeName(T) ++ " is not an int type");
+        const ShiftType = std.math.Log2Int(u8);
 
-        var result: T = 0;
+        var result: std.meta.Int(.unsigned, info.Int.bits)  = 0;
         for (bytes, 0..) |b, index| {
             const shifted = @shlWithOverflow(b, @as(ShiftType, @intCast(index * 8)));
             if (shifted[1] == 1) return error.Overflow;
 
-            result = result | @as(T, @bitCast(shifted[0]));
+            result = result | shifted[0];
         }
 
-        return result;
+        return @bitCast(result);
+    }
+
+    pub fn nextString(self: *Parser, allowed: std.EnumSet(String.Tag)) !String {
+        const ele = try self.next(.universal, false, null);
+        switch (ele.identifier.tag) {
+            inline
+            .string_utf8,
+            .string_numeric,
+            .string_printable,
+            .string_teletex,
+            .string_videotex,
+            .string_ia5,
+            .string_visible,
+            .string_universal,
+            .string_bmp,
+            => |t| {
+                const tagname = @tagName(t)["string_".len..];
+                const tag = std.meta.stringToEnum(String.Tag, tagname) orelse unreachable;
+                if (allowed.contains(tag)) {
+                    return String { .tag = tag, .data = self.view(ele) };
+                }
+            },
+            else => {},
+        }
+        return error.UnexpectedElement;
     }
 
     pub fn next(
@@ -307,7 +334,6 @@ pub const Identifier = packed struct(u8) {
         enumerated = 10,
         string_utf8 = 12,
         sequence = 16,
-        /// a set
         sequence_of = 17,
         string_numeric = 18,
         string_printable = 19,
@@ -330,6 +356,45 @@ pub const BitString = struct {
     pub fn bitLen(self: BitString) usize {
         return self.bytes.len * 8 + self.right_padding;
     }
+};
+
+pub const String = struct {
+    tag: Tag,
+    data: []const u8,
+
+    pub const Tag = enum {
+        /// Blessed.
+        utf8,
+        /// us-ascii ([-][0-9][eE][.])*
+        numeric,
+        /// us-ascii ([A-Z][a-z][0-9][.?!,][ \t])*
+        printable,
+        /// iso-8859-1 with escaping into different character sets.
+        /// Cursed.
+        teletex,
+        /// iso-8859-1
+        videotex,
+        /// us-ascii first 128 characters.
+        ia5,
+        /// us-ascii without control characters.
+        visible,
+        /// utf-32-be
+        universal,
+        /// utf-16-be
+        bmp,
+    };
+
+    pub const all = [_]Tag{
+        .utf8,
+        .numeric,
+        .printable,
+        .teletex,
+        .videotex,
+        .ia5,
+        .visible,
+        .universal,
+        .bmp,
+    };
 };
 
 pub const Oid = struct {
@@ -412,6 +477,17 @@ pub const Oid = struct {
         }
     }
 };
+
+fn comptimeOidFromString(comptime bytes: []const u8) Oid {
+    @setEvalBranchQuota(10_000);
+    var buf: [256]u8 = undefined;
+    return Oid.fromString(bytes, &buf) catch unreachable;
+}
+
+pub fn comptimeOid(comptime bytes: []const u8) [comptimeOidFromString(bytes).bytes.len]u8 {
+    const oid = comptime comptimeOidFromString(bytes);
+    return oid.bytes[0..oid.bytes.len].*;
+}
 
 fn testOid(expected: []const u8, dot_notation: []const u8) !void {
     var buf: [256]u8 = undefined;

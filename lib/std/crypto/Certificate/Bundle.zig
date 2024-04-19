@@ -1,16 +1,11 @@
-//! Bundle of trusted certificates for validating untrusted SSL certificates.
+//! Bundle of trusted root certificates for validating untrusted SSL certificates.
 
-/// Authoritative certificates.
+/// Authoritative certificates (CAs).
 issuers: std.HashMapUnmanaged(Certificate.Name, Certificate, MapContext, std.hash_map.default_max_load_percentage) = .{},
-/// DER encoded array of trusted root certs.
+/// Backing DER encoded array of `issuers`.
 bytes: std.ArrayListUnmanaged(u8) = .{},
 
 const log = std.log.scoped(.certificate_bundle);
-
-pub fn verify(self: Bundle, subject: Certificate, now_sec: i64, options: Certificate.VerifyOptions) !void {
-    const issuer = self.issuers.get(subject.issuer) orelse return error.CertificateIssuerNotFound;
-    try subject.verify(issuer, now_sec, options);
-}
 
 pub fn deinit(self: *Bundle, gpa: Allocator) void {
     self.issuers.deinit(gpa);
@@ -170,7 +165,6 @@ pub fn addCertsFromPem(cb: *Bundle, gpa: Allocator, pem: []const u8) !void {
     const begin_marker = "-----BEGIN CERTIFICATE-----";
     const end_marker = "-----END CERTIFICATE-----";
 
-    const now_sec = std.time.timestamp();
     const decoded_size_upper_bound = pem.len / 4 * 3;
     try cb.bytes.ensureUnusedCapacity(gpa, pem.len + decoded_size_upper_bound);
 
@@ -184,7 +178,7 @@ pub fn addCertsFromPem(cb: *Bundle, gpa: Allocator, pem: []const u8) !void {
         const decoded_start: u32 = @intCast(cb.bytes.items.len);
         const dest_buf = cb.bytes.allocatedSlice()[decoded_start..];
         cb.bytes.items.len += try base64.decode(dest_buf, encoded_cert);
-        try cb.parseCert(gpa, decoded_start, now_sec);
+        try cb.parseCert(gpa, decoded_start);
     }
 }
 
@@ -198,7 +192,7 @@ inline fn fmtCert(cert: Certificate) []const u8 {
     return stream.getWritten();
 }
 
-pub fn parseCert(cb: *Bundle, gpa: Allocator, decoded_start: u32, now_sec: i64) !void {
+pub fn parseCert(cb: *Bundle, gpa: Allocator, decoded_start: u32) !void {
     const cert = Certificate.fromDer(cb.bytes.items[decoded_start..]) catch |err| {
         log.warn("parse: {}", .{ err });
         return;
@@ -207,8 +201,10 @@ pub fn parseCert(cb: *Bundle, gpa: Allocator, decoded_start: u32, now_sec: i64) 
         log.debug("skipping {s} that is not a CA", .{ fmtCert(cert) });
         return;
     }
-    cert.validate(now_sec) catch |err| switch (err) {
-        error.CertificateNotYetValid => {}, // it may become valid while this program is running
+    cert.validate(0) catch |err| switch (err) {
+        // We don't know what times users may want to validate certificates against.
+        error.CertificateExpired,
+        error.CertificateNotYetValid => {},
         else => {
             log.debug("skipping {s}: {}", .{ fmtCert(cert), err });
             return;
@@ -268,18 +264,3 @@ test rescan {
     try bundle.rescan(allocator);
 }
 
-test verify {
-    if (builtin.os.tag == .wasi) return error.SkipZigTest;
-
-    const allocator = std.testing.allocator;
-
-    var bundle: Bundle = .{};
-    defer bundle.deinit(allocator);
-    try bundle.addCertsFromPem(allocator, @embedFile("../testdata/ca_bundle.pem"));
-
-    const cert_bytes = @embedFile("../testdata/cert_lets_encrypt_r3.der");
-    const cert = try Certificate.fromDer(cert_bytes);
-
-    // Wed 2024-04-17
-    try bundle.verify(cert, 1713312664, .{ .path_len = 1 });
-}

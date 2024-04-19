@@ -465,6 +465,9 @@ pub fn init(stream: anytype, ca_bundle: Certificate.Bundle, host: []const u8) !C
                                 .trust_chain_established => break :cert,
                                 else => return error.TlsUnexpectedMessage,
                             }
+                            var validator = Certificate.PathValidator{
+                                .options = .{ .bundle = ca_bundle, .time = now_sec },
+                            };
                             try hsd.ensure(1 + 4);
                             const cert_req_ctx_len = hsd.decode(u8);
                             if (cert_req_ctx_len != 0) return error.TlsIllegalParameter;
@@ -476,21 +479,18 @@ pub fn init(stream: anytype, ca_bundle: Certificate.Bundle, host: []const u8) !C
                                 const certd = try certs_decoder.sub(cert_size);
 
                                 cur_cert = try Certificate.fromDer(certd.buf);
-                                const verify_options = Certificate.VerifyOptions{
-                                    .path_len = cert_index,
-                                };
                                 if (cert_index == 0) {
                                     // Verify the host on the first certificate.
                                     try cur_cert.verifyHostName(host);
                                 } else {
-                                    try prev_cert.verify(cur_cert, now_sec, verify_options);
+                                    _ = try validator.validate(prev_cert, cur_cert);
                                 }
 
-                                if (ca_bundle.verify(cur_cert, now_sec, verify_options)) |_| {
+                                if (validator.validateCA(cur_cert)) |_| {
                                     handshake_state = .trust_chain_established;
                                     break :cert;
                                 } else |err| switch (err) {
-                                    error.CertificateIssuerNotFound => {},
+                                    error.CANotFound => {},
                                     else => |e| return e,
                                 }
 

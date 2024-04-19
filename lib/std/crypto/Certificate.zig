@@ -43,23 +43,6 @@ signature_algo: Signature.Algorithm,
 /// Different ECDSA curves have equal lengths.
 signature: der.BitString,
 
-pub const VerifyOptions = struct {
-    issuer: Validator = .{
-        .key_usage = .{ .key_cert_sign = .set_or_null },
-    },
-    subject: Validator = .{
-        .key_usage = .{ .digital_signature = .set_or_null },
-        .key_usage_ext = .{ .client_auth = .set_or_null },
-    },
-    /// How many certificates in the chain have been validated so far.
-    path_len: u32 = 0,
-
-    pub const Validator = struct {
-        key_usage: KeyUsage.Verifier = .{},
-        key_usage_ext: KeyUsageExt.Verifier = .{},
-    };
-};
-
 pub const Flag = enum {
     ignore,
     set,
@@ -74,54 +57,6 @@ pub const Flag = enum {
         return true;
     }
 };
-
-/// Verify `subject` is trusted by `issuer` according to RFC 5280 S6.
-///
-/// Verifies:
-///  * `subject.issuer == issuer.subject`
-///  * `subject` and `issuer` contain valid combinations of fields according to RFC 5280.
-///    SHA1 signature hashing algorithms are considered invalid.
-///  * The time validity of the subject and issuer.
-///  * `issuer.basic_constraints` are met.
-///  * Subject and issuer key usage and extended key usage flags match those specified in options.
-///  * If present, the issuer has at least one policy compatible with the subject's policy.
-///  * `issuer.signature` is valid for `subject.tbs_bytes`. Valid algorithms are those listed in
-///    Mozilla's Certificate policy [1], except for SHA1.
-///
-/// [1] https://www.mozilla.org/en-US/about/governance/policies/security-group/certs/policy/#5-certificates
-pub fn verify(subject: Cert, issuer: Cert, now_sec: i64, options: VerifyOptions) !void {
-    if (!subject.issuer.eql(issuer.subject)) return error.CertificateIssuerMismatch;
-
-    try subject.validate(now_sec);
-    try issuer.validate(now_sec);
-
-    try subject.key_usage.verify(options.subject.key_usage);
-    try issuer.key_usage.verify(options.issuer.key_usage);
-    try subject.key_usage_ext.verify(options.subject.key_usage_ext);
-    try issuer.key_usage_ext.verify(options.issuer.key_usage_ext);
-
-    if (issuer.basic_constraints.max_path_len) |max_path_len| {
-        if (options.path_len > max_path_len) return error.PathTooLong;
-    }
-
-    var issuer_policies = issuer.policiesIter();
-    const anyPolicy = comptimeOid("2.5.29.32.0");
-    while (try issuer_policies.next()) |ip| brk: {
-        if (std.mem.eql(u8, ip.oid.bytes, &anyPolicy)) break;
-
-        var subject_policies = subject.policiesIter();
-        while (try subject_policies.next()) |sp| {
-            if (std.mem.eql(u8, ip.oid.bytes, sp.oid.bytes)) break :brk;
-        }
-        return error.IssuerPolicyNotMet;
-    }
-
-    const signature = Signature{
-        .algo = subject.signature_algo,
-        .value = try Signature.Value.fromBitString(issuer.pub_key, subject.signature),
-    };
-    try signature.verify(subject.tbs_bytes, issuer.pub_key);
-}
 
 pub fn verifyHostName(sub: Cert, host_name: []const u8) !void {
     var iter = sub.subjectAliasesIter();
@@ -166,8 +101,6 @@ test checkHostName {
     try testing.expectEqual(false, checkHostName("foo.com", "f*.com"));
 }
 
-pub const ParseError = der.Parser.Error || error{};
-
 /// Creates references to `bytes` which must outlive returned `Cert`.
 pub fn fromDer(bytes: []const u8) !Cert {
     var parser = der.Parser{ .bytes = bytes };
@@ -196,10 +129,8 @@ pub fn fromDer(bytes: []const u8) !Cert {
                 const version_seq = try parser.next(.context_specific, true, @enumFromInt(0));
                 defer parser.seek(version_seq.slice.end);
 
-                const version_int = try parser.nextPrimitive(.integer);
-                const version = parser.view(version_int);
-                if (version.len != 1) return error.InvalidLength;
-                res.version = @enumFromInt(version[0]);
+                const version = try parser.nextInt(u8);
+                res.version = @enumFromInt(version);
             }
 
             const serial_number = try parser.nextPrimitive(.integer);
@@ -211,9 +142,7 @@ pub fn fromDer(bytes: []const u8) !Cert {
             res.subject = try Name.fromDer(&parser);
             res.pub_key = try PubKey.fromDer(&parser);
 
-            // final 3 fields are optional
-            var optional_parsed: u8 = 0;
-            while (parser.index != cert_tbs.slice.end and optional_parsed < 3) : (optional_parsed += 1) {
+            while (parser.index != cert_tbs.slice.end) {
                 const optional_ele = try parser.next(.context_specific, null, null);
                 defer parser.seek(optional_ele.slice.end);
 
@@ -308,8 +237,8 @@ fn parseExtensions(res: *Cert, parser: *der.Parser) !void {
         const extension_seq = try parser.nextSequence();
         defer parser.seek(extension_seq.slice.end);
 
-        const oid_ele = try parser.nextOid();
-        const tag = ExtensionTag.oids.get(parser.view(oid_ele)) orelse .unknown;
+        const oid = try parser.nextOid();
+        const tag = ExtensionTag.oids.get(oid.bytes) orelse .unknown;
         const critical = parser.nextBool() catch |err| switch (err) {
             error.UnexpectedElement => false,
             else => return err,
@@ -348,7 +277,6 @@ fn parseExtensions(res: *Cert, parser: *der.Parser) !void {
             .crl_distribution_points,
             .inhibit_anypolicy,
             .unknown => {
-                const oid = Oid{ .bytes = parser.view(oid_ele) };
                 var buffer: [256]u8 = undefined;
                 var stream = std.io.fixedBufferStream(&buffer);
                 oid.toString(stream.writer()) catch {};
@@ -365,18 +293,16 @@ fn parseExtensions(res: *Cert, parser: *der.Parser) !void {
 }
 
 /// Validates:
-///   - Serial number is less than or equal to 20 bytes.
 ///   - Key usage matches basic constraints.
 ///   - Signature algorithm is secure.
 ///   - Time validity.
 pub fn validate(self: Cert, now_sec: i64) !void {
-    if (self.serial_number.len > 20) return error.InvalidSerialNumber;
     if (self.key_usage.key_cert_sign and !self.basic_constraints.is_ca) return error.KeySignAndNotCA;
     try self.signature_algo.validate();
     // This check should optimally be at the end so that `Bundle.parseCert` does not add
     // certs that may be valid in the future but fail the above checks.
     //
-    // Such certs would fail all `verify` checks.
+    // Such certs would fail all `PathValidator.validate` checks.
     try self.validity.validate(now_sec);
 }
 
@@ -402,20 +328,108 @@ pub const SubjectAliasesIter = struct {
     }
 };
 
-fn subjectAliasesIter(c: Cert) SubjectAliasesIter {
+pub fn subjectAliasesIter(c: Cert) SubjectAliasesIter {
     const bytes = if (c.subject_aliases) |b| b else "";
     return SubjectAliasesIter{ .parser = der.Parser{ .bytes = bytes } };
 }
 
 pub const Policy = struct {
     oid: Oid,
-    // Should have a qualifiers field here as an extra verification option,
-    // but they'll need their own iterators which is messy.
-    //
-    // We can securely ignore them for now since the spec reads:
-    // > Optional qualifiers, which
-    // > MAY be present, are not expected to change the definition of the
-    // > policy.
+    /// This field allows reporting to the user what qualifiers have been accepted.
+    /// See `qualifiersIter`.
+    qualifiers: ?[]const u8 = null,
+
+    pub const any = Policy{ .oid = .{ .bytes = &der.comptimeOid("2.5.29.32.0"), } };
+
+    pub const Qualifier = union(enum) {
+        uri: DisplayText,
+        notice: Notice,
+
+        pub const Notice = struct {
+            ref: ?[]const u8,
+            text: ?[]const u8,
+        };
+
+        pub fn fromDer(parser: *der.Parser) !Qualifier {
+            const tag = try parser.nextEnum(Tag);
+            switch (tag) {
+                .uri => {
+                    const uri = try parser.next(.universal, false, .string_ia5);
+                    return .{ .uri = uri };
+                },
+                .notice => {
+                    const seq = try parser.nextSequence();
+                    defer parser.seek(seq.slice.end);
+
+                    const next = try parser.next(null, null, null);
+                    switch (next.identifier.tag) {
+                        .sequence => {
+
+                        },
+                        .string_ia5,
+                        .string_visible,
+                        .string_bmp,
+                        .string_utf8, => {
+                            const uri = try DisplayText.fromDer(parser);
+                            return .{ .uri = uri };
+                        },
+                        else => return error.InvalidNotice,
+                    }
+                },
+            }
+        }
+
+        const Tag = enum {
+            uri,
+            notice,
+
+            pub const oids = std.ComptimeStringMap{
+                .{ &comptimeOid("1.3.6.1.5.5.7.2.1"), .uri },
+                .{ &comptimeOid("1.3.6.1.5.5.7.2.2"), .notice },
+            };
+        };
+    };
+
+    pub const QualifiersIter = struct {
+        parser: der.Parser,
+
+        /// Next dnsName (RFC 5280 S4.2.1.6)
+        pub fn next(it: *@This()) !?Qualifier {
+            while (true) {
+                const ele = it.parser.next(.context_specific, null, null) catch |err| switch (err) {
+                    error.EndOfStream => return null,
+                    else => return err,
+                };
+                switch (@intFromEnum(ele.identifier.tag)) {
+                    2 => return it.parser.view(ele),
+                    else => {
+                        // We don't support the rest of the spec here since we currently only care
+                        // about verifying HTTPS.
+                    },
+                }
+            }
+            return null;
+        }
+    };
+
+    pub fn qualifiersIter(self: Policy) QualifiersIter {
+        const bytes = if (self.qualifiers) |b| b else "";
+        return PoliciesIter{ .parser = der.Parser{ .bytes = bytes } };
+    }
+
+    pub fn fromDer(parser: *der.Parser) !Policy {
+        const seq = try parser.nextSequence();
+        defer parser.seek(seq.slice.end);
+
+        const oid = try parser.nextOid();
+        var qualifiers: ?[]const u8 = null;
+        if (parser.index != seq.slice.end) {
+            const seq2 = try parser.nextSequence();
+            qualifiers = parser.view(seq2);
+        }
+
+        return Policy{ .oid = oid, .qualifiers = qualifiers };
+    }
 };
 
 pub const PoliciesIter = struct {
@@ -423,22 +437,16 @@ pub const PoliciesIter = struct {
 
     pub fn next(it: *@This()) !?Policy {
         while (true) {
-            const seq = it.parser.nextSequence() catch |err| switch (err) {
+            return Policy.fromDer(&it.parser) catch |err| switch (err) {
                 error.EndOfStream => return null,
                 else => return err,
-            };
-            defer it.parser.seek(seq.slice.end);
-
-            const ele = try it.parser.nextOid();
-            return Policy{
-                .oid = der.Oid{ .bytes = it.parser.view(ele) }
             };
         }
         return null;
     }
 };
 
-fn policiesIter(c: Cert) PoliciesIter {
+pub fn policiesIter(c: Cert) PoliciesIter {
     const bytes = if (c.policies) |b| b else "";
     return PoliciesIter{ .parser = der.Parser{ .bytes = bytes } };
 }
@@ -454,20 +462,24 @@ inline fn fmtCert(cert: Cert) []const u8 {
 }
 
 pub fn print(self: Cert, writer: anytype) !void {
-    try writer.writeAll("{ ");
+    try writer.writeAll("Cert{ ");
 
     // Name + serial number = unique certificate.
-    const name = self.issuer;
-    if (name.organization.data.len > 0) try writer.print("O: {s}, ", .{ name.organization.data });
-    if (name.country.data.len > 0) try writer.print("C: {s}, ", .{ name.country.data });
-    if (name.common_name.data.len > 0) try writer.print("CN: {s}, ", .{ name.common_name.data });
+    try writer.writeAll(" Issuer{ ");
+    try self.issuer.print(writer);
+    try writer.writeAll(" }");
 
     // spec says up to 20 bytes.
-    try writer.writeAll("SN: ");
+    try writer.writeAll(", SN: ");
     for (0..@min(20, self.serial_number.len)) |i| {
         try writer.print("{x:0>2}", .{ self.serial_number[i] });
     }
 
+    // Finally, this is useful for debugging.
+    try writer.print(", Time: {d} to {d}", .{ self.validity.not_before, self.validity.not_after });
+
+    try writer.writeAll(", Subject{ ");
+    try self.subject.print(writer);
     // These fields are useful for tracking down the certificate on aggregators.
     if (self.subject_key_identifier) |s| {
         try writer.writeAll(", SKI: ");
@@ -475,7 +487,7 @@ pub fn print(self: Cert, writer: anytype) !void {
             try writer.print("{x:0>2}", .{ c });
         }
     }
-
+    try writer.writeAll(" }");
     try writer.writeAll(" }");
 }
 
@@ -611,7 +623,7 @@ pub const Name = struct {
     kvs: KVs = [_][]const u8{""} ** unknown_len,
     kvs_len: u8 = 0,
 
-    const empty = DirectoryString{ .tag = .utf8, .data = "" };
+    const empty = DirectoryString.empty;
     const unknown_len = 7;
 
     pub const KVs = [unknown_len][]const u8;
@@ -720,6 +732,12 @@ pub const Name = struct {
             }
         }
         return true;
+    }
+
+    pub fn print(name: Name, writer: anytype) !void {
+        if (name.organization.data.len > 0) try writer.print("O: {s}, ", .{ name.organization.data });
+        if (name.country.data.len > 0) try writer.print("C: {s}, ", .{ name.country.data });
+        if (name.common_name.data.len > 0) try writer.print("CN: {s} ", .{ name.common_name.data });
     }
 };
 
@@ -988,13 +1006,15 @@ pub const Signature = struct {
     const sha2 = crypto.hash.sha2;
 };
 
+
+pub const PathLen = u16;
 /// Extension specifying if certificate is a CA and maximum number
 /// of non self-issued intermediate certificates that may follow this
 /// Certificate in a valid certification path.
 pub const BasicConstraints = struct {
     is_ca: bool = false,
     /// MUST be specified if `is_ca`.
-    max_path_len: ?u8 = null,
+    max_path_len: ?PathLen = null,
 
     pub fn fromDer(bytes: []const u8) !BasicConstraints {
         var res: BasicConstraints = .{};
@@ -1003,14 +1023,21 @@ pub const BasicConstraints = struct {
         _ = try parser.nextSequence();
         if (!parser.eof()) {
             res.is_ca = try parser.nextBool();
-            if (!parser.eof()) res.max_path_len = try parser.nextInt(u8);
+            if (!parser.eof()) res.max_path_len = try parser.nextInt(PathLen);
         }
 
         return res;
     }
+
+    pub fn verify(issuer: BasicConstraints, path_len: u16) !void {
+        if (!issuer.is_ca) return error.IssuerNotCA;
+        if (issuer.max_path_len) |l| {
+            if (path_len > l) return error.MaxPathLenExceeded;
+        }
+    }
 };
 
-fn MakeVerifier(comptime T: type) type {
+fn MakeValidator(comptime T: type) type {
     // map each field to a flag
     const to_copy = std.meta.fields(T);
    var fields: [to_copy.len]std.builtin.Type.StructField = undefined;
@@ -1054,8 +1081,8 @@ pub const KeyUsage = packed struct {
         return res;
     }
 
-    pub const Verifier = MakeVerifier(KeyUsage);
-    pub fn verify(self: KeyUsage, validator: Verifier) !void {
+    pub const Validator = MakeValidator(KeyUsage);
+    pub fn validate(self: KeyUsage, validator: Validator) !void {
         inline for (std.meta.fields(KeyUsage)) |f| {
             const expected = @field(validator, f.name);
             const actual = @field(self, f.name);
@@ -1115,8 +1142,8 @@ pub const KeyUsageExt = packed struct {
         return res;
     }
 
-    pub const Verifier = MakeVerifier(KeyUsageExt);
-    pub fn verify(self: KeyUsageExt, validator: Verifier) !void {
+    pub const Validator = MakeValidator(KeyUsageExt);
+    pub fn validate(self: KeyUsageExt, validator: Validator) !void {
         inline for (std.meta.fields(KeyUsageExt)) |f| {
             const expected = @field(validator, f.name);
             const actual = @field(self, f.name);
@@ -1139,59 +1166,61 @@ pub const GeneralNameTag = enum(u5) {
 };
 
 pub const DirectoryString = struct {
-    tag: Tag,
+    tag: der.String.Tag,
     data: []const u8,
 
-    const Tag = enum {
-        teletex,
-        printable,
-        universal,
-        utf8,
-        bmp,
-    };
     const Self = @This();
 
     pub fn fromDer(parser: *der.Parser) !Self {
-        const ele = try parser.next(.universal, false, null);
-        const tag: Tag = switch (ele.identifier.tag) {
-            .string_teletex => .teletex,
-            .string_printable => .printable,
-            .string_universal => .universal,
-            .string_utf8 => .utf8,
-            .string_bmp => .bmp,
-            else => return error.InvalidDirectoryString,
-        };
+        const string = try parser.nextString(std.EnumSet(der.String.Tag).initMany(&[_]der.String.Tag{
+            .teletex,
+            .printable,
+            .universal,
+            .utf8,
+            .bmp,
+        }));
 
-        return .{ .tag = tag, .data = parser.view(ele) };
+        return .{ .tag = string.tag, .data = string.data };
     }
 
     /// TODO: use RFC 5280 S7.2 for better internationalization
     pub fn cmp(self: Self, other: Self) bool {
         return std.mem.eql(u8, self.data, other.data);
     }
+
+    const empty = Self{ .tag = .utf8, .data = "" };
 };
 
-fn comptimeOidFromString(comptime bytes: []const u8) Oid {
-    @setEvalBranchQuota(10_000);
-    var buf: [256]u8 = undefined;
-    return Oid.fromString(bytes, &buf) catch unreachable;
-}
+pub const DisplayText = struct {
+    tag: der.String.Tag,
+    data: []const u8,
 
-fn comptimeOid(comptime bytes: []const u8) [comptimeOidFromString(bytes).bytes.len]u8 {
-    const oid = comptime comptimeOidFromString(bytes);
-    return oid.bytes[0..oid.bytes.len].*;
-}
+    const Self = @This();
+
+    pub fn fromDer(parser: *der.Parser) !Self {
+        const string = try parser.nextString(std.EnumSet(der.String.Tag).initMany(&[_]der.String.Tag{
+         .ia5,
+         .visible,
+         .bmp,
+         .utf8,
+        }));
+
+        return .{ .tag = string.tag, .data = string.data };
+    }
+};
 
 const std = @import("../std.zig");
 const der = @import("der.zig");
 const rsa = @import("rsa.zig");
 pub const Bundle = @import("Certificate/Bundle.zig");
+pub const PathValidator = @import("Certificate/PathValidator.zig");
 
 const crypto = std.crypto;
 const mem = std.mem;
 const DateTime = std.date_time.DateTime;
 const Cert = @This();
 const Oid = der.Oid;
+const comptimeOid = der.comptimeOid;
 const ecdsa = crypto.sign.ecdsa;
 const sha2 = crypto.hash.sha2;
 const testing = std.testing;
@@ -1206,6 +1235,7 @@ const log = std.log.scoped(.certificate);
 
 test {
     _ = Bundle;
+    _ = PathValidator;
 }
 
 /// Strictly for testing
